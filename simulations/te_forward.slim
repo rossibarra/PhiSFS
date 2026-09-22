@@ -1,0 +1,306 @@
+// Forward TE simulations for normalizeTE validation.
+//
+// Requires SLiM 5.x.  Functional (m2) and disabled (m3) alleles with the
+// same te_id are merged into one insertion-presence allele in the final
+// sampled output.  MOVEMENT_MODE selects copy-and-paste or cut-and-paste.
+
+function (integer$) drawUnusedTEPosition(void)
+{
+    used = sim.getValue("usedTEPositions");
+    while (T)
+    {
+        position = rdunif(1, 0, CHROMOSOME_LENGTH - 1);
+        if (!any(used == position))
+        {
+            sim.setValue("usedTEPositions", c(used, position));
+            return position;
+        }
+    }
+}
+
+initialize()
+{
+    initializeSLiMOptions(keepPedigrees=T, randomizeCallbacks=F);
+
+    if (!exists("OUT_PREFIX"))
+        defineConstant("OUT_PREFIX", "te_simulation");
+    if (!exists("RANDOM_SEED"))
+        defineConstant("RANDOM_SEED", 1001);
+    if (!exists("MOVEMENT_MODE"))
+        defineConstant("MOVEMENT_MODE", "copy");
+    if (!exists("POPULATION_SIZE"))
+        defineConstant("POPULATION_SIZE", 500);
+    if (!exists("CHROMOSOME_LENGTH"))
+        defineConstant("CHROMOSOME_LENGTH", 3000000);
+    if (!exists("BURNIN_TICKS"))
+        defineConstant("BURNIN_TICKS", 5000);
+    if (!exists("CHANGE_TICKS"))
+        defineConstant("CHANGE_TICKS", 250);
+    if (!exists("INITIAL_TE_COUNT"))
+        defineConstant("INITIAL_TE_COUNT", 5000);
+    if (!exists("SAMPLE_SIZE"))
+        defineConstant("SAMPLE_SIZE", 25);
+    if (!exists("SNP_MUTATION_RATE"))
+        defineConstant("SNP_MUTATION_RATE", 1e-6);
+    if (!exists("TE_JUMP_RATE"))
+        defineConstant("TE_JUMP_RATE", 1e-4);
+    if (!exists("POST_BURNIN_MULTIPLIER"))
+        defineConstant("POST_BURNIN_MULTIPLIER", 1.0);
+    if (!exists("TE_DISABLE_RATE"))
+        defineConstant("TE_DISABLE_RATE", 5e-5);
+    if (!exists("TE_SELECTION_COEFF"))
+        defineConstant("TE_SELECTION_COEFF", 0.0);
+
+    defineConstant("FINAL_TICK", BURNIN_TICKS + CHANGE_TICKS);
+
+    if ((MOVEMENT_MODE != "copy") & (MOVEMENT_MODE != "cut"))
+        stop("MOVEMENT_MODE must be 'copy' or 'cut'");
+    if ((SAMPLE_SIZE < 20) | (SAMPLE_SIZE > POPULATION_SIZE))
+        stop("SAMPLE_SIZE must be between 20 and POPULATION_SIZE");
+    if ((POST_BURNIN_MULTIPLIER < 0.0) | (TE_JUMP_RATE < 0.0) |
+        (TE_JUMP_RATE * POST_BURNIN_MULTIPLIER > 1.0))
+        stop("TE movement probabilities must lie in [0, 1]");
+    if ((TE_DISABLE_RATE < 0.0) | (TE_DISABLE_RATE > 1.0))
+        stop("TE_DISABLE_RATE must lie in [0, 1]");
+    if (INITIAL_TE_COUNT > CHROMOSOME_LENGTH)
+        stop("INITIAL_TE_COUNT exceeds the number of available positions");
+    if ((BURNIN_TICKS < 1) | (CHANGE_TICKS < 1))
+        stop("BURNIN_TICKS and CHANGE_TICKS must both be positive");
+
+    setSeed(RANDOM_SEED);
+    initializeTreeSeq();
+
+    // A high, metacentric-style map limits linked-selection effects on SNPs.
+    recombinationEnds = c(500000, 1000000, 1500000, 2000000,
+        2500000, CHROMOSOME_LENGTH - 1);
+    recombinationRates = c(1e-4, 5e-5, 1e-5, 1e-5, 5e-5, 1e-4);
+    initializeRecombinationRate(recombinationRates, recombinationEnds);
+
+    initializeMutationRate(SNP_MUTATION_RATE);
+    initializeMutationType("m1", 0.5, "f", 0.0);  // neutral SNP
+    initializeGenomicElementType("g1", m1, 1.0);
+    initializeGenomicElement(g1, 0, CHROMOSOME_LENGTH - 1);
+
+    // Functional and disabled forms have the same fitness effect.  Disabling
+    // changes mobility, not the selection coefficient of the insertion.
+    initializeMutationType("m2", 0.5, "f", TE_SELECTION_COEFF);
+    initializeMutationType("m3", 0.5, "f", TE_SELECTION_COEFF);
+    m2.convertToSubstitution = F;
+    m3.convertToSubstitution = F;
+}
+
+1 early()
+{
+    outputPaths = c(OUT_PREFIX + ".trees",
+        OUT_PREFIX + ".parameters.tsv",
+        OUT_PREFIX + ".samples.tsv",
+        OUT_PREFIX + ".te_population.tsv",
+        OUT_PREFIX + ".te_presence.tsv");
+    for (path in outputPaths)
+        if (fileExists(path))
+            stop("refusing to overwrite existing output: " + path);
+
+    sim.addSubpop("p1", POPULATION_SIZE);
+    sim.tag = 0;  // next unused insertion ID
+    sim.setValue("usedTEPositions", integer(0));
+    community.rescheduleScriptBlock(s_finish, start=FINAL_TICK,
+        end=FINAL_TICK);
+}
+
+1 late()
+{
+    // These source copies begin fixed, as in the SLiM TE recipe.  Because they
+    // are shared by every haplotype, their selection coefficients do not
+    // generate relative fitness differences.  New insertions do.
+    haplosomes = sim.subpopulations.haplosomes;
+    for (teIndex in seqLen(INITIAL_TE_COUNT))
+    {
+        position = drawUnusedTEPosition();
+        te = haplosomes.addNewDrawnMutation(m2, position);
+        te.tag = sim.tag;
+        te.setValue("insertionTick", community.tick);
+        te.setValue("parentTE", -1);
+        sim.tag = sim.tag + 1;
+    }
+}
+
+modifyChild()
+{
+    // Functional -> disabled is an allelic-state change at one insertion.
+    // The te_id and the insertion's original tick are preserved.
+    for (haplosome in child.haplosomes)
+    {
+        activeTEs = haplosome.mutationsOfType(m2);
+        if (!size(activeTEs))
+            next;
+
+        disabling = activeTEs[runif(size(activeTEs)) < TE_DISABLE_RATE];
+        for (activeTE in disabling)
+        {
+            disabledTEs = sim.mutationsOfType(m3);
+            sameInsertion = disabledTEs[disabledTEs.tag == activeTE.tag];
+
+            haplosome.removeMutations(activeTE);
+            if (size(sameInsertion))
+            {
+                haplosome.addMutations(sameInsertion[0]);
+            }
+            else
+            {
+                disabledTE = haplosome.addNewDrawnMutation(m3,
+                    activeTE.position);
+                disabledTE.tag = activeTE.tag;
+                disabledTE.setValue("insertionTick",
+                    activeTE.getValue("insertionTick"));
+                disabledTE.setValue("parentTE",
+                    activeTE.getValue("parentTE"));
+            }
+        }
+    }
+    return T;
+}
+
+s_transpose 1: late()
+{
+    if (community.tick > FINAL_TICK)
+        return;
+
+    jumpRate = TE_JUMP_RATE;
+    if (community.tick > BURNIN_TICKS)
+        jumpRate = jumpRate * POST_BURNIN_MULTIPLIER;
+
+    if (jumpRate == 0.0)
+        return;
+
+    for (individual in sim.subpopulations.individuals)
+    {
+        for (haplosome in individual.haplosomes)
+        {
+            activeTEs = haplosome.mutationsOfType(m2);
+            if (!size(activeTEs))
+                next;
+
+            // Each functional copy has one Bernoulli opportunity to move in
+            // this tick.  Disabled copies never enter this set.
+            movingTEs = activeTEs[runif(size(activeTEs)) < jumpRate];
+            for (sourceTE in movingTEs)
+            {
+                destination = drawUnusedTEPosition();
+                newTE = haplosome.addNewDrawnMutation(m2, destination);
+                newTE.tag = sim.tag;
+                newTE.setValue("insertionTick", community.tick);
+                newTE.setValue("parentTE", sourceTE.tag);
+                sim.tag = sim.tag + 1;
+
+                // Copy-and-paste retains the source.  Cut-and-paste removes
+                // it only from this haplotype; it may remain elsewhere.
+                if (MOVEMENT_MODE == "cut")
+                    haplosome.removeMutations(sourceTE);
+            }
+        }
+    }
+}
+
+s_finish 100000000 late()
+{
+    sampledIndividuals = sample(p1.individuals, SAMPLE_SIZE);
+    sampledHaplosomes = NULL;
+    sampleLines = c("sample_index\tindividual_pedigree_id\thaplosome_pedigree_id\thaplosome_subposition");
+    sampleIndex = 1;
+    for (individual in sampledIndividuals)
+    {
+        haplosome = sample(individual.haplosomes, 1);
+        sampledHaplosomes = c(sampledHaplosomes, haplosome);
+        sampleLines = c(sampleLines, paste(c(sampleIndex,
+            individual.pedigreeID, haplosome.haplosomePedigreeID,
+            haplosome.chromosomeSubposition), sep="\t"));
+        sampleIndex = sampleIndex + 1;
+    }
+
+    activeTEs = sim.mutationsOfType(m2);
+    disabledTEs = sim.mutationsOfType(m3);
+    teIDs = integer(0);
+    if (size(activeTEs))
+        teIDs = c(teIDs, activeTEs.tag);
+    if (size(disabledTEs))
+        teIDs = c(teIDs, disabledTEs.tag);
+    teIDs = sort(unique(teIDs));
+
+    populationLines = c(paste(c("te_id", "parent_te_id", "position",
+        "insertion_tick", "age", "functional_count", "disabled_count",
+        "inserted_count", "inserted_frequency"), sep="\t"));
+
+    presenceHeader = c("te_id", "position", "insertion_tick", "age");
+    for (index in seqLen(SAMPLE_SIZE))
+        presenceHeader = c(presenceHeader, "sample_" + index);
+    presenceLines = c(paste(presenceHeader, sep="\t"));
+
+    haplosomeCount = size(sim.subpopulations.haplosomes);
+    for (teID in teIDs)
+    {
+        activeState = activeTEs[activeTEs.tag == teID];
+        disabledState = disabledTEs[disabledTEs.tag == teID];
+        if ((size(activeState) > 1) | (size(disabledState) > 1))
+            stop("multiple mutation objects found for insertion " + teID);
+
+        states = c(activeState, disabledState);
+        position = states[0].position;
+        if (size(activeState))
+        {
+            insertionTick = activeState[0].getValue("insertionTick");
+            parentTE = activeState[0].getValue("parentTE");
+            functionalCount = sim.mutationCounts(NULL, activeState[0]);
+        }
+        else
+        {
+            insertionTick = disabledState[0].getValue("insertionTick");
+            parentTE = disabledState[0].getValue("parentTE");
+            functionalCount = 0;
+        }
+
+        if (size(disabledState))
+            disabledCount = sim.mutationCounts(NULL, disabledState[0]);
+        else
+            disabledCount = 0;
+
+        insertedCount = functionalCount + disabledCount;
+        age = community.tick - insertionTick;
+        populationLines = c(populationLines, paste(c(teID, parentTE,
+            position, insertionTick, age, functionalCount, disabledCount,
+            insertedCount, insertedCount / haplosomeCount), sep="\t"));
+
+        presence = c(teID, position, insertionTick, age);
+        for (haplosome in sampledHaplosomes)
+            presence = c(presence,
+                asInteger(any(haplosome.containsMutations(states))));
+        presenceLines = c(presenceLines, paste(presence, sep="\t"));
+    }
+
+    parameterLines = c("parameter\tvalue",
+        "configured_seed\t" + RANDOM_SEED,
+        "slim_seed\t" + getSeed(),
+        "movement_mode\t" + MOVEMENT_MODE,
+        "population_size\t" + POPULATION_SIZE,
+        "chromosome_length\t" + CHROMOSOME_LENGTH,
+        "burnin_ticks\t" + BURNIN_TICKS,
+        "change_ticks\t" + CHANGE_TICKS,
+        "final_tick\t" + FINAL_TICK,
+        "initial_te_count\t" + INITIAL_TE_COUNT,
+        "sample_size\t" + SAMPLE_SIZE,
+        "snp_mutation_rate\t" + SNP_MUTATION_RATE,
+        "te_jump_rate\t" + TE_JUMP_RATE,
+        "post_burnin_multiplier\t" + POST_BURNIN_MULTIPLIER,
+        "te_disable_rate\t" + TE_DISABLE_RATE,
+        "te_selection_coeff\t" + TE_SELECTION_COEFF);
+
+    writeFile(OUT_PREFIX + ".parameters.tsv", parameterLines);
+    writeFile(OUT_PREFIX + ".samples.tsv", sampleLines);
+    writeFile(OUT_PREFIX + ".te_population.tsv", populationLines);
+    writeFile(OUT_PREFIX + ".te_presence.tsv", presenceLines);
+
+    // Remembering the sampled individuals makes their nodes easy to identify
+    // after simplification.  The samples file identifies the chosen haplotype.
+    sim.treeSeqRememberIndividuals(sampledIndividuals);
+    sim.treeSeqOutput(OUT_PREFIX + ".trees");
+    community.simulationFinished();
+}
