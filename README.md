@@ -328,6 +328,16 @@ The default rejects heterozygous calls. Use `--heterozygous missing` only when t
 analysis should treat heterozygous individuals as uncallable. Sites with fewer than
 20 callable individuals are excluded from the spectrum.
 
+> **Warning: Phi-SFS is biased upward when the target is small.** It is a distance,
+> so it is strictly positive even between identical spectra, and that floor grows as
+> the number of sites falls — roughly 0.08 at 250 sites and 0.04 at 1,000. Two
+> Phi-SFS values computed from different numbers of sites are therefore not
+> comparable, and the smaller target scores higher for no biological reason. Always
+> report the site count, and correct or equalize it before comparing TE categories,
+> distance bins, or anything else that differs in abundance. See
+> [PHI_SFS_SAMPLE_SIZE_BIAS.md](docs/PHI_SFS_SAMPLE_SIZE_BIAS.md) for the size of the
+> effect and two validated corrections.
+
 ## Farm/Quobyte launchers
 
 Submit launchers with `sbatch` from the repository checkout. The launchers activate
@@ -488,6 +498,8 @@ interpretation of their spread.
   target and matching design.
 - [PHI_SFS_IMPLEMENTATION_PLAN.md](docs/PHI_SFS_IMPLEMENTATION_PLAN.md) — SFS projection,
   polarization mixture, and Phi-SFS definition.
+- [PHI_SFS_SAMPLE_SIZE_BIAS.md](docs/PHI_SFS_SAMPLE_SIZE_BIAS.md) — finite-sample bias in
+  Phi-SFS, the sampling floor, and two validated correction routes.
 - [BOOTSTRAP_DISCARDED_APPROACHES.md](docs/BOOTSTRAP_DISCARDED_APPROACHES.md) — evaluated
   approaches that are not part of the production route.
 - [CHANGELOG.md](docs/CHANGELOG.md) — release-level behavior changes.

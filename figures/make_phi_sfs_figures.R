@@ -30,23 +30,23 @@ draw_sfs <- function(x, neutral_sfs, te_sfs, color, title, show_y = FALSE) {
     # The wider neutral bars remain a single uniform gray. Narrower opaque TE
     # bars are drawn in front, avoiding transparency-induced color changes.
     rect(x - 0.022, 0, x + 0.022, neutral_sfs,
-         col = neutral_fill, border = neutral, lwd = 1.5)
+         col = neutral_fill, border = neutral, lwd = 2.3)
     rect(x - 0.015, 0, x + 0.015, te_sfs,
-         col = adjustcolor(color, alpha.f = 0.58), border = color, lwd = 2.1)
+         col = adjustcolor(color, alpha.f = 0.58), border = color, lwd = 3.1)
 
     axis(1, at = c(0.05, 0.95), labels = c("0.05", "0.95"),
-         lwd = 2.2, lwd.ticks = 2.2, cex.axis = 1.2)
+         lwd = 3.0, lwd.ticks = 3.0, cex.axis = 1.45)
     if (show_y) {
         axis(2, at = c(0, ymax), labels = c("0", ""),
-             lwd = 2.2, lwd.ticks = 2.2, cex.axis = 1.1)
+             lwd = 3.0, lwd.ticks = 3.0, cex.axis = 1.4)
     }
-    box(bty = "l", lwd = 2.2)
-    mtext("DAF", side = 1, line = 2.2, cex = 1.3, font = 2)
-    title(main = title, col.main = color, cex.main = 1.35, font.main = 2,
+    box(bty = "l", lwd = 3.0)
+    mtext("DAF", side = 1, line = 2.2, cex = 1.6, font = 2)
+    title(main = title, col.main = color, cex.main = 1.55, font.main = 2,
           line = 0.45)
     legend("topright", legend = c("SNPs", "TEs"),
            fill = c(neutral_fill, adjustcolor(color, alpha.f = 0.58)),
-           border = c(neutral, color), bty = "n", cex = 1.15,
+           border = c(neutral, color), bty = "n", cex = 1.4,
            text.font = 2, x.intersp = 0.6, y.intersp = 0.9)
 }
 
@@ -54,8 +54,8 @@ draw_cdf_arrow <- function(color) {
     plot.new()
     plot.window(xlim = c(0, 1), ylim = c(0, 1))
     arrows(0.47, 0.88, 0.47, 0.16, length = 0.13, angle = 28,
-           lwd = 4.0, col = color)
-    text(0.62, 0.53, "CDF", cex = 1.25, font = 2, col = ink)
+           lwd = 5.2, col = color)
+    text(0.62, 0.53, "CDF", cex = 1.5, font = 2, col = ink)
 }
 
 draw_cdf <- function(x, neutral_sfs, te_sfs, color, fill,
@@ -71,27 +71,27 @@ draw_cdf <- function(x, neutral_sfs, te_sfs, color, fill,
     polygon(c(neutral_step$x, rev(te_step$x)),
             c(neutral_step$y, rev(te_step$y)),
             col = fill, border = NA)
-    lines(neutral_step$x, neutral_step$y, col = neutral, lwd = 3.0)
-    lines(te_step$x, te_step$y, col = color, lwd = 3.2)
+    lines(neutral_step$x, neutral_step$y, col = neutral, lwd = 4.1)
+    lines(te_step$x, te_step$y, col = color, lwd = 4.4)
 
     axis(1, at = c(0.05, 0.95), labels = c("0.05", "0.95"),
-         lwd = 2.2, lwd.ticks = 2.2, cex.axis = 1.2)
+         lwd = 3.0, lwd.ticks = 3.0, cex.axis = 1.45)
     if (show_y) {
         axis(2, at = c(0, 1), labels = c("0", "1"),
-             lwd = 2.2, lwd.ticks = 2.2, cex.axis = 1.2)
+             lwd = 3.0, lwd.ticks = 3.0, cex.axis = 1.4)
     }
-    box(bty = "l", lwd = 2.2)
-    mtext("DAF", side = 1, line = 2.2, cex = 1.3, font = 2)
+    box(bty = "l", lwd = 3.0)
+    mtext("DAF", side = 1, line = 2.2, cex = 1.6, font = 2)
 
     target_bin <- max(which(x <= arrow_x))
     target_y <- (te_cdf[target_bin] + neutral_cdf[target_bin]) / 2
     text(annotation_x, annotation_y, expression(Phi[SFS]),
-         cex = 1.45, font = 2, col = ink)
+         cex = 1.75, font = 2, col = ink)
     arrows(annotation_x - 0.03, annotation_y + 0.08,
-           arrow_x, target_y, length = 0.10, lwd = 2.4, col = ink)
+           arrow_x, target_y, length = 0.11, lwd = 3.2, col = ink)
 }
 
-draw_vertical_label <- function(label, cex = 1.25) {
+draw_vertical_label <- function(label, cex = 1.5) {
     plot.new()
     plot.window(xlim = c(0, 1), ylim = c(0, 1))
     text(0.55, 0.5, label, srt = 90, cex = cex, font = 2, xpd = NA)
@@ -147,7 +147,7 @@ draw_violin <- function(values, center, width = 0.30) {
     half_width <- width * d$y / max(d$y)
     polygon(c(center - half_width, rev(center + half_width)),
             c(d$x, rev(d$x)), col = "#D0D0D0", border = "#B5B5B5",
-            lwd = 1.2)
+            lwd = 1.8)
 }
 
 make_null_figure <- function(path) {
@@ -174,44 +174,45 @@ make_null_figure <- function(path) {
     par(mar = rep(0, 4))
     draw_vertical_label(
         expression(paste("Null-standardized ", Phi[SFS], " (Z)")),
-        cex = 1.1
+        cex = 1.3
     )
 
     par(mar = c(4.7, 4.3, 1.0, 0.6), mgp = c(2.8, 0.75, 0),
         tcl = -0.35, las = 1)
     plot(NA, xlim = c(0.45, 4.55), ylim = c(-2.5, 4.0), axes = FALSE,
          xlab = "", ylab = "", xaxs = "i", yaxs = "i")
-    abline(h = 0, col = "#8F8F8F", lty = 2, lwd = 1.5)
+    abline(h = 0, col = "#8F8F8F", lty = 2, lwd = 2.1)
     for (i in seq_along(nulls)) draw_violin(nulls[[i]], i)
-    lines(1:4, observed_z, col = "#79A6D2", lwd = 2.1)
+    lines(1:4, observed_z, col = "#79A6D2", lwd = 3.1)
     points(1:4, observed_z, pch = 21, bg = point_colors,
-           col = "white", lwd = 1.4, cex = 1.75)
-    axis(1, at = 1:4, labels = categories, lwd = 2.0,
-         lwd.ticks = 2.0, cex.axis = 1.05)
-    axis(2, at = seq(-2, 4, by = 0.5), lwd = 2.0,
-         lwd.ticks = 2.0, cex.axis = 1.0)
-    box(bty = "l", lwd = 2.0)
+           col = "white", lwd = 2.0, cex = 2.0)
+    axis(1, at = 1:4, labels = categories, lwd = 2.8,
+         lwd.ticks = 2.8, cex.axis = 1.25)
+    axis(2, at = seq(-2, 4, by = 1), lwd = 2.8,
+         lwd.ticks = 2.8, cex.axis = 1.25)
+    box(bty = "l", lwd = 2.8)
     mtext("Distance to nearest gene", side = 1, line = 3.1,
-          cex = 1.2)
+          cex = 1.45, font = 2)
 
     par(mar = c(4.7, 0.4, 1.0, 0.5))
     plot.new()
     plot.window(xlim = c(0, 1), ylim = c(0, 1))
     text(0.5, 0.91, expression(-log[10](italic(P)*"-value")),
-         cex = 1.05)
+         cex = 1.3, font = 2)
     edges <- seq(0.10, 0.90, length.out = length(blue) + 1)
     rect(edges[-length(edges)], 0.81, edges[-1], 0.865,
          col = blue, border = NA)
-    rect(0.10, 0.81, 0.90, 0.865, border = ink, lwd = 1.2)
+    rect(0.10, 0.81, 0.90, 0.865, border = ink, lwd = 1.8)
     tick_x <- 0.10 + (0:3) / 3 * 0.80
-    segments(tick_x, 0.79, tick_x, 0.81, lwd = 1.1)
-    text(tick_x, 0.755, labels = 0:3, cex = 0.95)
+    segments(tick_x, 0.785, tick_x, 0.81, lwd = 1.7)
+    text(tick_x, 0.75, labels = 0:3, cex = 1.15)
     rect(0.12, 0.61, 0.24, 0.67, col = "#D0D0D0",
-         border = "#B5B5B5", lwd = 1.2)
-    text(0.31, 0.64, "Null distribution", adj = 0, cex = 1.0)
+         border = "#B5B5B5", lwd = 1.8)
+    text(0.31, 0.64, "Null distribution", adj = 0, cex = 1.2,
+         font = 2)
 
     mtext("Illustrative example", side = 3, line = 0.5,
-          outer = TRUE, cex = 1.55, font = 2)
+          outer = TRUE, cex = 1.85, font = 2)
     dev.off()
 }
 
