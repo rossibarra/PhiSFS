@@ -1,6 +1,6 @@
-# normalizeTE v0.7.0
+# PhiTE v0.7.0
 
-normalizeTE builds neutral SNP control sets matched to the posterior ages of a focal
+PhiTE builds neutral SNP control sets matched to the posterior ages of a focal
 variant category, then compares their unfolded site-frequency spectra. Dataset A may
 be either TEs or SNPs; dataset B is currently SNPs. The production workflow therefore
 supports the primary TE-versus-SNP analysis and SNP-versus-SNP negative controls.
@@ -13,7 +13,7 @@ production settings are linked under [Methods and validation](#methods-and-valid
 
 ## Citation
 
-If you use normalizeTE or the Phi-SFS method, please cite:
+If you use PhiTE or the Phi-SFS method, please cite:
 
 > Liu, B., Munasinghe, M., Fairbanks, R. A., Hirsch, C. N., and Ross-Ibarra, J. (2025).
 > Genome-wide selection on transposable elements in maize. bioRxiv 2025.09.16.676665.
@@ -311,6 +311,7 @@ python -m normalize_tes.te_age_target \
 python -m normalize_tes.bootstrap_target_matcher \
   --store "$STORE" \
   --target "$TARGET" \
+  -A "$A_TYPE" \
   --candidate-rows "$CANDIDATES" \
   --output "$MATCHES" \
   --work-dir "$WORK_DIR" \
@@ -336,6 +337,7 @@ Matcher flags:
 |---|---|
 | `--store` | store supplying candidate SNP ages |
 | `--target` | final masked target |
+| `-A`, `--a-type` | focal type, `TE` or `SNP`; must agree with the target metadata |
 | `--candidate-rows` | TE-excluded control universe and its provenance sidecar |
 | `--output` | new matched-control bundle |
 | `--work-dir` | durable per-replicate state used by `--resume` |
@@ -350,6 +352,15 @@ on durable storage and repeat the identical command after preemption. Disjoint m
 preflights the necessary pool size: at least `replicates` times $M$ eligible candidates
 must exist. It then removes every published control from later candidate pools. If the
 pool cannot support all sets, the run fails; it never falls back to reuse.
+
+The matcher treats `-A` as an analysis constraint, not merely a label. `-A TE`
+requires a final target built with the TE polarity mask and
+`--max-flipped-fraction 0.5`, so an exact 50% derived-support tie is retained and a
+site with no usable orientation draws is not. `-A SNP` requires the SNP-orientable
+eligibility path and rejects a target carrying the TE polarity filter. In both cases,
+the shared eligibility filter must have been applied before $M$ and the focal-age CDF
+were fixed. SNP frequency flipping remains part of SFS construction; the age matcher
+does not use allele frequency and remains SFS-blind.
 
 For a SNP focal set, build `TARGET` directly with `--a-type SNP`,
 `--te-positions "$A_POSITIONS"`, and `--vcf-eligibility "$ELIGIBILITY"`; omit
