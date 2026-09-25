@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=96G
-#SBATCH --time=12:00:00
+#SBATCH --time=1-12:00:00
 #SBATCH --output=bootstrap-match-%j.out
 #SBATCH --error=bootstrap-match-%j.err
 
@@ -16,6 +16,9 @@
 # reaching mkdir. Move the logs afterwards if you want them filed away.
 
 # The canonical production launcher for bootstrap-target control matching.
+# It requires mutually disjoint controls across all 1001 sets. The matcher
+# fails before creating replicate state when the candidate universe cannot hold
+# REPLICATES x target-size unique SNPs; it never silently falls back to reuse.
 #
 # Submit with sbatch, never srun: an srun started from an interactive shell dies
 # with that shell, which is how the first production attempt was lost at 48
@@ -29,32 +32,36 @@
 #   STORE            canonical interval store on durable storage        [required]
 #   TARGET           target directory built by normalize_tes.te_age_target         [required]
 #   OUTPUT           bundle directory to publish; must not exist        [required]
-#   CANDIDATE_ROWS   .npy from normalize_tes.build_candidate_rows, or "all" to use
-#                    every eligible non-target row       (default: required path)
+#   CANDIDATE_ROWS   .npy from normalize_tes.build_candidate_rows       [required]
+#   CANDIDATE_REPORT provenance JSON (default: CANDIDATE_ROWS.json)
 #   WORK_DIR         durable resume directory       (default: OUTPUT.work)
-#   REPLICATES       control sets to publish                    (default: 100)
+#   REPLICATES       control sets to publish                   (default: 1001)
 #   RESTARTS         stratified restarts per replicate            (default: 3)
 #   SEED             global seed                                (default: 1002)
-#   TE_POSITIONS     build TARGET from this position file if TARGET is absent
+#   A_TYPE           TE|SNP for the focal target                         (TE)
+#   A_POSITIONS      build TARGET from this position file if TARGET is absent
+#   VCF_ELIGIBILITY  shared authenticated callability/orientation artifact [required]
 #   ACCEPTANCE_QUANTILE        bootstrap quantile for the target threshold (0.50)
 #   MISSING_POSITION_POLICY    error|drop for target construction     (error)
 #   SCRATCH_HEADROOM_GB        scratch reserved for the target CDF      (32)
 #   TE_POLARITY_MASK           polarity mask dir, when building a target (unset)
-#   MAX_FLIPPED_FRACTION       discard TEs flipped above this fraction  (unset)
+#   MAX_FLIPPED_FRACTION       discard TEs flipped above this fraction   (0.5)
 #
 # Example:
 #
 #   sbatch --export=ALL,STORE=/quobyte/project/data/snp_interval_store,\
 #   TARGET=results/targets/in_gene,OUTPUT=results/bootstrap_matches/in_gene,\
-#   CANDIDATE_ROWS=results/candidate-rows.npy,WORK_DIR=results/work-in-gene,SEED=1002 \
+#   CANDIDATE_ROWS=results/candidate-rows.npy,VCF_ELIGIBILITY=results/vcf-eligibility,\
+#   WORK_DIR=results/work-in-gene,SEED=1002 \
 #     slurm/run_bootstrap_matching.sbatch
 #
 # Measured on the 75-draw production store (18.2 GB) at this allocation, for a
 # 4,067-site target with 100 replicates x 3 restarts: 2 h 12 m wall clock and
-# 37.7 GiB peak RSS (SLURM job 37821602). Target construction is the other
-# memory peak: 16.0 GB for a 35,512-site target. Scale --time roughly linearly
-# in target size and replicate count, and keep --mem at 96G unless a measured
-# figure says otherwise.
+# 37.7 GiB peak RSS (SLURM job 37821602). At that measured rate, the 1001-set
+# default needs about 22 h for the same target; the 36 h request leaves room
+# for variation. Target construction is the other memory peak: 16.0 GB for a
+# 35,512-site target. Scale --time roughly linearly in target size and replicate
+# count, and keep --mem at 96G unless a measured figure says otherwise.
 
 set -euo pipefail
 
@@ -65,17 +72,40 @@ PROJECT="${PROJECT:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.."
 : "${STORE:?set STORE to the completed interval-store directory}"
 : "${TARGET:?set TARGET to the target directory}"
 : "${OUTPUT:?set OUTPUT to the bundle directory to publish}"
-: "${CANDIDATE_ROWS:?set CANDIDATE_ROWS to a .npy of candidate rows, or to \"all\"}"
+: "${CANDIDATE_ROWS:?set CANDIDATE_ROWS to the VCF-eligible SNP candidate .npy}"
+: "${VCF_ELIGIBILITY:?set VCF_ELIGIBILITY to the shared eligibility artifact}"
 : "${TMPDIR:?Farm must provide per-job TMPDIR under /local/scratch}"
 WORK_DIR="${WORK_DIR:-${OUTPUT}.work}"
-REPLICATES="${REPLICATES:-100}"
+REPLICATES="${REPLICATES:-1001}"
 RESTARTS="${RESTARTS:-3}"
 SEED="${SEED:-1002}"
-TE_POSITIONS="${TE_POSITIONS:-}"
+A_TYPE="${A_TYPE:-TE}"
+A_POSITIONS="${A_POSITIONS:-${TE_POSITIONS:-}}"
 ACCEPTANCE_QUANTILE="${ACCEPTANCE_QUANTILE:-0.50}"
 MISSING_POSITION_POLICY="${MISSING_POSITION_POLICY:-error}"
 TE_POLARITY_MASK="${TE_POLARITY_MASK:-}"
-MAX_FLIPPED_FRACTION="${MAX_FLIPPED_FRACTION:-}"
+MAX_FLIPPED_FRACTION="${MAX_FLIPPED_FRACTION:-0.5}"
+CANDIDATE_REPORT="${CANDIDATE_REPORT:-${CANDIDATE_ROWS}.json}"
+
+if [[ "$A_TYPE" != "TE" && "$A_TYPE" != "SNP" ]]; then
+    echo "A_TYPE must be TE or SNP" >&2
+    exit 5
+fi
+if [[ "$CANDIDATE_ROWS" == "all" ]]; then
+    echo "CANDIDATE_ROWS=all is incompatible with shared SNP eligibility; build the candidate .npy first" >&2
+    exit 5
+fi
+if [[ "$A_TYPE" == "TE" && -z "$TE_POLARITY_MASK" ]]; then
+    echo "A_TYPE=TE requires TE_POLARITY_MASK for the inclusive >=50% derived rule" >&2
+    exit 5
+fi
+if [[ "$A_TYPE" == "SNP" && -n "$TE_POLARITY_MASK" ]]; then
+    echo "A_TYPE=SNP must not use TE_POLARITY_MASK" >&2
+    exit 5
+fi
+if [[ "$A_TYPE" == "SNP" ]]; then
+    MAX_FLIPPED_FRACTION=""
+fi
 
 cd "$PROJECT"
 mkdir -p "$TMPDIR/interval_store"
@@ -105,10 +135,26 @@ if (( free_kib < required_kib * 6 / 5 + headroom_kib )); then
          "(${required_kib} KiB) plus ${SCRATCH_HEADROOM_GB}G for the target CDF" >&2
     exit 2
 fi
+
+python - "$CANDIDATE_REPORT" "$VCF_ELIGIBILITY" <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+report_path, eligibility = map(Path, sys.argv[1:])
+if not report_path.is_file():
+    raise SystemExit(f"missing candidate provenance report: {report_path}")
+report = json.loads(report_path.read_text(encoding="utf-8"))
+used = report.get("vcf_eligibility")
+if used is None or Path(used).resolve() != eligibility.resolve():
+    raise SystemExit(
+        f"{report_path} records VCF eligibility {used!r}, but this run requests "
+        f"{str(eligibility.resolve())!r}"
+    )
+PYEOF
 # A masked target does not use the scratch-backed CDF writer: te_age_target
 # builds the whole block in memory. For those runs --mem, not scratch, is the
 # constraint, and the job prints its projected peak before building.
-if [[ -n "$TE_POLARITY_MASK" ]]; then
+if [[ "$A_TYPE" == "TE" ]]; then
     echo "note: masked target construction builds CDFs in memory; --mem is the" \
          "binding constraint, not scratch"
 fi
@@ -120,7 +166,7 @@ date
 # the age it recorded belongs to a different event. With a mask, each TE's age
 # CDF is built from its agreeing draws only.
 polarity_option=()
-if [[ -n "$TE_POLARITY_MASK" ]]; then
+if [[ "$A_TYPE" == "TE" ]]; then
     polarity_option+=(--te-polarity-mask "$TE_POLARITY_MASK")
     if [[ -n "$MAX_FLIPPED_FRACTION" ]]; then
         polarity_option+=(--max-flipped-fraction "$MAX_FLIPPED_FRACTION")
@@ -131,14 +177,16 @@ elif [[ -n "$MAX_FLIPPED_FRACTION" ]]; then
 fi
 
 if [[ ! -d "$TARGET" ]]; then
-    if [[ -z "$TE_POSITIONS" ]]; then
-        echo "TARGET $TARGET does not exist and TE_POSITIONS is unset" >&2
+    if [[ -z "$A_POSITIONS" ]]; then
+        echo "TARGET $TARGET does not exist and A_POSITIONS is unset" >&2
         exit 4
     fi
     echo "=== building target $TARGET ==="; date
     python -m normalize_tes.te_age_target \
         --store "$TMPDIR/interval_store" \
-        --te-positions "$TE_POSITIONS" \
+        --te-positions "$A_POSITIONS" \
+        --a-type "$A_TYPE" \
+        --vcf-eligibility "$VCF_ELIGIBILITY" \
         --output "$TARGET" \
         --scratch-dir "$TMPDIR" \
         --bootstrap-replicates 10000 \
@@ -157,18 +205,29 @@ else
     # get matching against the unmasked target: the block above is skipped, the
     # mask is silently unused, and nothing in the output says so.
     echo "=== target $TARGET already exists; verifying it matches the request ==="
-    python - "$TARGET" "$TE_POLARITY_MASK" "$MAX_FLIPPED_FRACTION" <<'PYEOF'
+    python - "$TARGET" "$A_TYPE" "$VCF_ELIGIBILITY" "$TE_POLARITY_MASK" "$MAX_FLIPPED_FRACTION" <<'PYEOF'
 import json, sys
 from pathlib import Path
 
-target, requested_mask, requested_fraction = sys.argv[1], sys.argv[2], sys.argv[3]
+target, a_type, eligibility, requested_mask, requested_fraction = sys.argv[1:]
 meta = json.loads((Path(target) / "metadata.json").read_text(encoding="utf-8"))
 recorded = meta.get("te_polarity") or None
 
-if not requested_mask:
+if meta.get("a_type") != a_type:
+    raise SystemExit(f"{target} records a_type={meta.get('a_type')!r}, requested {a_type!r}")
+eligibility_record = meta.get("vcf_eligibility") or {}
+used_eligibility = str(Path(eligibility_record.get("mask", "")).resolve())
+wanted_eligibility = str(Path(eligibility).resolve())
+if used_eligibility != wanted_eligibility:
+    raise SystemExit(
+        f"{target} was built with VCF eligibility {used_eligibility}, "
+        f"but VCF_ELIGIBILITY requests {wanted_eligibility}."
+    )
+
+if a_type == "SNP":
     if recorded is not None:
-        print(f"note: {target} was built with a polarity mask "
-              f"({recorded['sites_kept']:,} TEs kept)", file=sys.stderr)
+        raise SystemExit(f"SNP target {target} unexpectedly records a TE polarity mask")
+    print(f"target matches A_TYPE=SNP and eligibility {wanted_eligibility}")
     sys.exit(0)
 
 if recorded is None:
@@ -199,11 +258,7 @@ print(f"target matches the requested mask: {recorded['sites_kept']:,} TEs kept, 
 PYEOF
 fi
 
-if [[ "$CANDIDATE_ROWS" == "all" ]]; then
-    candidate_option=(--all-eligible)
-else
-    candidate_option=(--candidate-rows "$CANDIDATE_ROWS")
-fi
+candidate_option=(--candidate-rows "$CANDIDATE_ROWS")
 
 echo "=== matching: $REPLICATES replicates x $RESTARTS restarts ==="; date
 python -m normalize_tes.bootstrap_target_matcher \

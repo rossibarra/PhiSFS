@@ -14,11 +14,37 @@ from normalize_tes.bootstrap_target_matcher import (
     log_search_grid,
     main,
     optimize_restart,
+    parse_args,
     validate_restart_result,
 )
 from normalize_tes.snp_age_store import open_snp_age_store
 from normalize_tes.swap_control_sampler import analysis_points, eligible_candidates, search_grid
 from test_swap_control_sampler import _interval_store, _target
+
+
+def test_default_replicate_count_provides_reference_and_null_sets():
+    assert OptimizerConfig().replicates == 1001
+    args = parse_args([
+        "--store", "store", "--target", "target", "--all-eligible",
+        "--output", "output", "--disjoint-replicates",
+    ])
+    assert args.replicates == 1001
+    assert args.disjoint_replicates
+
+
+def test_disjoint_capacity_fails_before_creating_work_state(tmp_path):
+    store = _interval_store(tmp_path / "store")
+    target = _target(tmp_path / "target", store)
+    output = tmp_path / "output"
+    work = tmp_path / "work"
+    with pytest.raises(ValueError, match=r"requires 6 unique candidate SNPs"):
+        _run_matcher(
+            store, target, output,
+            "--replicates", "3", "--disjoint-replicates",
+            "--work-dir", str(work),
+        )
+    assert not output.exists()
+    assert not work.exists()
 
 
 def test_bootstrap_counts_and_cdf_are_reproducible():

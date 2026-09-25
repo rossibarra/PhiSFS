@@ -10,11 +10,12 @@
 #SBATCH --output=phi-sfs-%j.out
 #SBATCH --error=phi-sfs-%j.err
 
-# Compare the unfolded site frequency spectrum of a TE target with that of every
-# matched control set.
+# Compare the unfolded site frequency spectrum of focal set A with matched
+# control sets B, and calibrate its Wasserstein distance against B-to-B null
+# distances.
 #
 # Polarity comes from two sources and neither is the VCF. TE sites are polarized
-# by biology -- a TE insertion is the derived state -- and control SNPs by the
+# by biology -- a TE insertion is the derived state -- and SNPs in either role by the
 # ARG-derived table from slurm/run_ancestral_table.sbatch, applied as a posterior
 # weighted mixture rather than a majority call. Running this against an
 # unpolarized VCF as though REF were ancestral would mis-polarize about a third
@@ -30,7 +31,8 @@
 #
 #   sbatch --export=ALL,TARGET=results/targets/in_gene,\
 #   MATCHES=results/bootstrap_matches/in_gene,VCF=/path/all.chr.vcf.gz,\
-#   ANCESTRAL=results/ancestral-75draw,OUTPUT=results/phi_sfs/in_gene \
+#   ANCESTRAL=results/ancestral-75draw,OUTPUT=results/phi_sfs/in_gene,\
+#   A_TYPE=TE,B_TYPE=SNP \
 #     slurm/run_phi_sfs.sbatch
 #
 # Variables:
@@ -39,6 +41,10 @@
 #   VCF         genome-wide polarized-agnostic VCF                [required]
 #   ANCESTRAL   table directory from slurm/run_ancestral_table.sbatch   [required]
 #   OUTPUT      results directory to publish; must not exist      [required]
+#   A_TYPE      TE|SNP for focal set A                                  (TE)
+#   B_TYPE      SNP for matched control sets B                          (SNP)
+#   REFERENCE_REPLICATE  prespecified B0 replicate ID                     (0)
+#   MIN_NULL_REPLICATES  minimum QC-passing null sets                  (1000)
 #   HETEROZYGOUS  error|missing for diploid calls                 (error)
 #
 # The scan is the dominant cost and is polarity-independent: it reads the VCF
@@ -56,6 +62,10 @@ PROJECT="${PROJECT:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.."
 : "${ANCESTRAL:?set ANCESTRAL to the ancestral-state table directory}"
 : "${OUTPUT:?set OUTPUT to the results directory to publish}"
 HETEROZYGOUS="${HETEROZYGOUS:-error}"
+A_TYPE="${A_TYPE:-TE}"
+B_TYPE="${B_TYPE:-SNP}"
+REFERENCE_REPLICATE="${REFERENCE_REPLICATE:-0}"
+MIN_NULL_REPLICATES="${MIN_NULL_REPLICATES:-1000}"
 cd "$PROJECT"
 # Batch jobs get a non-login shell, where `module` does not exist.
 . "$PROJECT/slurm/slurm_conda_bootstrap.sh"
@@ -69,6 +79,7 @@ echo "target     $TARGET"
 echo "matches    $MATCHES"
 echo "ancestral  $ANCESTRAL"
 echo "vcf        $VCF"
+echo "comparison $A_TYPE versus $B_TYPE"
 date
 python -m normalize_tes.phi_sfs \
     --target "$TARGET" \
@@ -76,5 +87,9 @@ python -m normalize_tes.phi_sfs \
     --vcf "$VCF" \
     --ancestral-table "$ANCESTRAL" \
     --output "$OUTPUT" \
+    -A "$A_TYPE" \
+    -B "$B_TYPE" \
+    --reference-replicate "$REFERENCE_REPLICATE" \
+    --min-null-replicates "$MIN_NULL_REPLICATES" \
     --heterozygous "$HETEROZYGOUS"
 date
