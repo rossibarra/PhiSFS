@@ -18,6 +18,7 @@ from .snp_age_dataset import load_native_position_list
 from .snp_age_store import is_interval_store, open_snp_age_store, store_schema
 from .snp_position_resolution import resolve_native_position_requests
 from .release_provenance import software_provenance
+from .vcf_eligibility import load_eligible_rows
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,25 @@ def largest_remainder_quotas(
         ranked = np.argsort(-fractions, kind="stable")
         quotas[ranked[:remaining]] += 1
     return quotas
+
+
+def target_eligibility_mask(
+    target_rows: np.ndarray, eligible_rows: np.ndarray
+) -> np.ndarray:
+    """Return the aligned mask selecting VCF-eligible target rows.
+
+    This helper is polarity-independent and works for either a TE or SNP A
+    target.  Polarity filtering remains a separate operation.
+    """
+    rows = np.asarray(target_rows)
+    eligible = np.asarray(eligible_rows)
+    if rows.ndim != 1 or eligible.ndim != 1:
+        raise ValueError("target and VCF-eligible rows must be one-dimensional")
+    if not np.issubdtype(rows.dtype, np.integer):
+        raise ValueError("target rows must be integers")
+    if not np.issubdtype(eligible.dtype, np.integer):
+        raise ValueError("VCF-eligible rows must be integers")
+    return np.isin(rows, eligible, assume_unique=False)
 
 
 def _analysis_cdfs(
@@ -609,6 +629,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
              "the mutation on a different branch and recorded that branch's age",
     )
     parser.add_argument(
+        "--a-type", choices=("TE", "SNP"), default="TE",
+        help="variant type of target A (default: TE). SNP uses the full ARG "
+             "posterior orientation in the shared VCF eligibility artifact",
+    )
+    parser.add_argument(
+        "--vcf-eligibility", type=Path,
+        help="authenticated polarity-independent mask from "
+             "normalize_tes.vcf_eligibility. Apply it to target A before "
+             "fixing its size and age CDF; use the same artifact for B candidates",
+    )
+    parser.add_argument(
         "--max-flipped-fraction", type=float, default=None,
         help="discard any TE whose flipped fraction, among draws with data for "
              "it, exceeds this. Requires --te-polarity-mask. A TE the ARG mostly "
@@ -653,10 +684,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     assert included_chromosomes is not None and included_vcf_positions is not None
     included_rows = resolution.included_rows
 
+    if args.a_type == "SNP" and args.max_flipped_fraction is not None:
+        raise SystemExit("--max-flipped-fraction is valid only with --a-type TE")
     if args.max_flipped_fraction is not None and args.te_polarity_mask is None:
         raise SystemExit("--max-flipped-fraction requires --te-polarity-mask")
     if args.max_flipped_fraction is not None and not 0.0 <= args.max_flipped_fraction <= 1.0:
         raise SystemExit("--max-flipped-fraction must lie in [0, 1]")
+    if args.a_type == "SNP" and args.te_polarity_mask is not None:
+        raise SystemExit("--te-polarity-mask is valid only with --a-type TE")
+    if args.a_type == "SNP" and args.vcf_eligibility is None:
+        raise SystemExit(
+            "--a-type SNP requires --vcf-eligibility so zero-orientation SNPs "
+            "are removed before the target age CDF is fixed"
+        )
 
     keep_draws = None
     polarity_report: dict | None = None
@@ -691,6 +731,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "had no agreeing draw and retain all of theirs"
             )
 
+    eligibility_report: dict | None = None
+    if args.vcf_eligibility is not None:
+        eligible_rows = load_eligible_rows(
+            args.vcf_eligibility, store, variant_type=args.a_type,
+            expected_min_callable=20,
+        )
+        eligible = target_eligibility_mask(included_rows, eligible_rows)
+        before = int(eligible.size)
+        if not eligible.any():
+            raise SystemExit(
+                "VCF eligibility removed every target site; rebuild the target "
+                "and controls from a compatible analysis VCF"
+            )
+        positions = positions[eligible]
+        included_chromosomes = included_chromosomes[eligible]
+        included_vcf_positions = included_vcf_positions[eligible]
+        included_rows = np.asarray(included_rows)[eligible]
+        if keep_draws is not None:
+            # Polarity selection runs first because its mask authenticates the
+            # complete resolved target row order. At this point keep_draws is
+            # already aligned to those retained rows, so apply the identical
+            # VCF mask to preserve site/draw alignment.
+            keep_draws = keep_draws[eligible]
+        eligibility_report = {
+            "mask": str(args.vcf_eligibility.resolve()),
+            "sites_before": before,
+            "sites_removed": int((~eligible).sum()),
+            "sites_kept": int(eligible.sum()),
+        }
+        print(
+            f"VCF eligibility {eligibility_report['sites_removed']:,} of "
+            f"{before:,} target sites removed, "
+            f"{eligibility_report['sites_kept']:,} kept"
+        )
+
     result = build_target(
         store,
         positions,
@@ -724,6 +799,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "excluded_positions": resolution.excluded_coordinates(),
         "missing_position_policy": args.missing_position_policy,
         "te_polarity": polarity_report,
+        "a_type": args.a_type,
+        "vcf_eligibility": eligibility_report,
         "bin_width": int(np.diff(result.age_bins[:2])[0]),
         "cdf_evaluation": (
             "P(X < right_cell_edge); equal interval weighting"

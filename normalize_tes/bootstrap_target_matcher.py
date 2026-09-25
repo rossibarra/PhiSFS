@@ -40,7 +40,7 @@ ALGORITHM_VERSION = "bootstrap-target-exact-greedy-v1"
 
 @dataclass(frozen=True)
 class OptimizerConfig:
-    replicates: int = 100
+    replicates: int = 1001
     restarts: int = 3
     min_epochs: int = 10
     max_epochs: int = 50
@@ -906,6 +906,17 @@ def run(args: argparse.Namespace) -> None:
     candidates, candidate_digest = _candidate_rows(args, store, target_rows)
     if candidates.size <= target_rows.size:
         raise ValueError("candidate universe must exceed target set size")
+    if config.disjoint_replicates:
+        required_candidates = config.replicates * target_rows.size
+        if candidates.size < required_candidates:
+            raise ValueError(
+                "disjoint matching requires "
+                f"{required_candidates:,} unique candidate SNPs "
+                f"({config.replicates:,} sets x {target_rows.size:,} sites), "
+                f"but the candidate universe contains only {candidates.size:,}. "
+                "Prespecify fewer replicates or use an alternate null design; "
+                "controls will not be silently reused."
+            )
     points = analysis_points(age_bins)
     exact_step = float(age_bins[1] - age_bins[0])
     if config.search_bin_width < exact_step:
@@ -1014,8 +1025,9 @@ def run(args: argparse.Namespace) -> None:
         # published sets share no controls. That is zero membership OVERLAP, not
         # zero dependence: each replicate draws from a pool the earlier ones
         # depleted, and all of them bootstrap the same observed TE sample.
-        # Stratum depth makes the constraint cheap -- the scarcest age decile
-        # holds ~787 sets' worth of candidates against the 100 needed.
+        # Total capacity was checked before any work directory or replicate
+        # state was created. Retain this per-replicate guard as an invariant
+        # check in case the selection logic changes.
         if config.disjoint_replicates and claimed_arr.size:
             replicate_candidates = candidates[~np.isin(candidates, claimed_arr)]
             if replicate_candidates.size < target_rows.size:
@@ -1172,9 +1184,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                              "identities and parameters must match or it stops")
     parser.add_argument("--keep-work", action="store_true",
                         help="keep the work directory after a successful publish")
-    parser.add_argument("--replicates", type=int, default=100,
-                        help="bootstrap replicates to match, one published control "
-                             "set each")
+    parser.add_argument(
+        "--replicates", type=int, default=1001,
+        help="bootstrap replicates to match, one published control set each "
+             "(default: 1001, comprising one reference and 1000 null sets)",
+    )
     parser.add_argument(
         "--restarts", type=int, default=3,
         help="independent stratified restarts per replicate; the published set "
@@ -1217,9 +1231,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--disjoint-replicates", action="store_true",
-        help="publish 100 mutually disjoint sets: each replicate is optimized "
+        help="publish mutually disjoint sets: each replicate is optimized "
              "against the candidate universe minus every row already published, "
-             "so no control SNP appears in two published sets. This removes "
+             "so no control SNP appears in two published sets. A preflight "
+             "requires at least replicates x target-sites candidates. This removes "
              "shared membership, not statistical dependence: replicates still "
              "share the observed TE sample and the store, and later sets draw "
              "from a pool the earlier ones depleted",

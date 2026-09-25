@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Calculate Phi-SFS for a TE target and its matched SNP control sets.
+"""Calculate Phi-SFS for a focal A set and its matched SNP control sets.
 
-Phi-SFS is the total variation distance between the projected, normalized,
-unfolded site frequency spectrum of a TE target set and that of one age-matched
-SNP control set. README section 7 and PHI_SFS_IMPLEMENTATION_PLAN.md section 2
-carry the full derivation.
+Phi-SFS is the first Wasserstein distance between the projected, normalized,
+unfolded site frequency spectrum of a focal set and that of one age-matched
+SNP control set. README section 8 and PHI_SFS_WASSERSTEIN_CODING_PLAN.md carry
+the full derivation.
 
 Input assumptions, all of which are recorded in the output metadata:
 
@@ -15,7 +15,7 @@ Input assumptions, all of which are recorded in the output metadata:
   filtered preprocessing VCF, so every record at a requested coordinate is used.
 * The VCF is **not** assumed to be polarized, and no REF or INFO annotation is
   consulted. TE sites are polarized by biology -- an insertion is the derived
-  state -- and control SNPs by the ARG-derived table given to
+  state -- and SNPs in either A or B by the ARG-derived table given to
   `--ancestral-table`, as a posterior-weighted mixture over the two observed
   alleles.
 """
@@ -44,7 +44,7 @@ from .release_provenance import software_provenance
 from .sample_age_matched_controls import _load_target, _sha256_arrays
 
 
-SCHEMA_VERSION = "phi-sfs-v1"
+SCHEMA_VERSION = "phi-sfs-wasserstein-v1"
 
 # Per-replicate identifier arrays published by each supported matched-control
 # schema. The swap sampler saves ten correlated states from each of ten chains,
@@ -89,13 +89,27 @@ class SiteCount:
 
 
 class PhiResult(NamedTuple):
-    """Phi-SFS with the bin-level residuals and the two identity checks."""
+    """Wasserstein Phi-SFS and the arrays that determine its direction."""
 
     value: float
-    residual: np.ndarray
-    positive: np.ndarray
-    reverse_positive: float
-    half_l1: float
+    cdf_a: np.ndarray
+    cdf_b: np.ndarray
+    cdf_residual: np.ndarray
+    bin_residual: np.ndarray
+    mean_daf_difference: float
+
+
+class PhiCalibration(NamedTuple):
+    """An observed Phi-SFS calibrated against neutral-null distances."""
+
+    observed: float
+    null: np.ndarray
+    null_mean: float
+    null_sd: float
+    z_score: float
+    p_value: float
+    exceedances: int
+    null_z_scores: np.ndarray
 
 
 def hypergeometric_projection(k: int, n: int, m: int = PROJECTION_SIZE) -> np.ndarray:
@@ -244,41 +258,109 @@ def normalized_spectrum(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return values, values / total
 
 
-def phi_sfs(te: np.ndarray, snp: np.ndarray) -> PhiResult:
-    """Return Phi-SFS and its bin-level residuals for two normalized spectra.
+def phi_sfs(
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    daf: np.ndarray | None = None,
+) -> PhiResult:
+    """Return the one-dimensional Wasserstein distance between two SFS arrays.
 
-    Phi-SFS is the total variation distance between the two spectra. All four
-    of these forms are equal, because both spectra sum to one:
+    The inputs are probability masses on the same strictly increasing derived
+    allele-frequency grid. On a discrete one-dimensional grid, Wasserstein-1
+    is the area between their CDFs. The default grid is the retained projected
+    counts 1 through 19 divided by the projection size of 20.
 
-        Phi = sum_j max(t_j - s_j, 0)      positive TE-minus-SNP residual mass
-            = sum_j max(s_j - t_j, 0)      positive SNP-minus-TE residual mass
-            = (1/2) sum_j |t_j - s_j|      half the L1 distance
-            = 1 - sum_j min(t_j, s_j)      one minus the overlapping mass
-
-    Phi therefore lies in [0, 1] and is symmetric in its two arguments, even
-    though the returned bin residuals are oriented as TE minus SNP. Zero means
-    the two spectra coincide; one means they share no mass in any bin.
-
-    The two alternative forms are returned alongside the score and are checked
-    against it here. The identity is algebraic rather than contingent, so this
-    is a cheap tripwire against a malformed input reaching this function, not a
-    test of the statistic.
+    The distance is unsigned. ``mean_daf_difference`` and the oriented
+    residual arrays use ``a - b`` and retain information about direction.
     """
-    te = np.asarray(te, dtype=np.float64)
-    snp = np.asarray(snp, dtype=np.float64)
-    expected = (PROJECTION_SIZE - 1,)
-    if te.shape != expected or snp.shape != expected:
-        raise ValueError("normalized spectra must contain bins 1 through 19")
-    if not np.isclose(te.sum(), 1.0) or not np.isclose(snp.sum(), 1.0):
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if a.ndim != 1 or b.ndim != 1 or a.shape != b.shape:
+        raise ValueError("normalized spectra must be one-dimensional and equal length")
+    if a.size < 2:
+        raise ValueError("normalized spectra must contain at least two bins")
+    if not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
+        raise ValueError("normalized spectra must be finite")
+    if np.any(a < 0.0) or np.any(b < 0.0):
+        raise ValueError("normalized spectra must be nonnegative")
+    if not np.isclose(a.sum(), 1.0, rtol=0.0, atol=1e-8) or not np.isclose(
+        b.sum(), 1.0, rtol=0.0, atol=1e-8
+    ):
         raise ValueError("both spectra must be normalized")
-    residual = te - snp
-    positive = np.maximum(residual, 0.0)
-    value = float(positive.sum())
-    reverse = float(np.maximum(-residual, 0.0).sum())
-    half_l1 = float(np.abs(residual).sum() / 2.0)
-    if not (np.isclose(value, reverse) and np.isclose(value, half_l1)):
-        raise RuntimeError("Phi-SFS consistency identity failed")
-    return PhiResult(value, residual, positive, reverse, half_l1)
+
+    if daf is None:
+        if a.size != RETAINED_BINS.size:
+            raise ValueError(
+                "daf is required unless spectra use the default bins 1 through 19"
+            )
+        grid = RETAINED_BINS.astype(np.float64) / PROJECTION_SIZE
+    else:
+        grid = np.asarray(daf, dtype=np.float64)
+        if grid.ndim != 1 or grid.shape != a.shape:
+            raise ValueError("daf must be one-dimensional and match the spectra")
+        if not np.all(np.isfinite(grid)):
+            raise ValueError("daf must be finite")
+        if np.any(np.diff(grid) <= 0.0):
+            raise ValueError("daf must be strictly increasing")
+
+    cdf_a = np.cumsum(a)
+    cdf_b = np.cumsum(b)
+    cdf_residual = cdf_a - cdf_b
+    bin_residual = a - b
+    value = float(np.sum(np.abs(cdf_residual[:-1]) * np.diff(grid)))
+    mean_daf_difference = float(np.dot(bin_residual, grid))
+    return PhiResult(
+        value,
+        cdf_a,
+        cdf_b,
+        cdf_residual,
+        bin_residual,
+        mean_daf_difference,
+    )
+
+
+def calibrate_phi(observed: float, null: np.ndarray) -> PhiCalibration:
+    """Standardize an observed distance and compute its Monte Carlo P-value.
+
+    The Z-score uses the null sample standard deviation (``ddof=1``). The
+    one-sided P-value counts null distances greater than or equal to the
+    observed distance and applies the add-one correction to numerator and
+    denominator.
+    """
+    observed_array = np.asarray(observed, dtype=np.float64)
+    if observed_array.ndim != 0:
+        raise ValueError("observed distance must be a scalar")
+    observed_value = float(observed_array)
+    if not math.isfinite(observed_value) or observed_value < 0.0:
+        raise ValueError("observed distance must be finite and nonnegative")
+
+    null_values = np.asarray(null, dtype=np.float64)
+    if null_values.ndim != 1:
+        raise ValueError("null distances must be one-dimensional")
+    if null_values.size < 2:
+        raise ValueError("at least two null distances are required")
+    if not np.all(np.isfinite(null_values)) or np.any(null_values < 0.0):
+        raise ValueError("null distances must be finite and nonnegative")
+
+    null_mean = float(np.mean(null_values))
+    null_sd = float(np.std(null_values, ddof=1))
+    if null_sd == 0.0:
+        raise ValueError("null distances have zero sample standard deviation")
+    z_score = (observed_value - null_mean) / null_sd
+    exceedances = int(np.count_nonzero(null_values >= observed_value))
+    p_value = (1.0 + exceedances) / (null_values.size + 1.0)
+    null_z_scores = (null_values - null_mean) / null_sd
+    return PhiCalibration(
+        observed_value,
+        null_values.copy(),
+        null_mean,
+        null_sd,
+        float(z_score),
+        float(p_value),
+        exceedances,
+        null_z_scores,
+    )
 
 
 class _HashingStream(io.RawIOBase):
@@ -402,6 +484,8 @@ class PolarityResolver:
         self._present = present_draw_count
         self.te_sites = 0
         self.control_sites = 0
+        self.control_usable_draws = 0
+        self.control_unusable_draws = 0
 
     def __call__(self, chrom: str, position: int, ref: str, alt: str) -> float:
         if (chrom, position) in self._te:
@@ -439,6 +523,9 @@ class PolarityResolver:
                 f"allele ({ref}/{alt}) ancestral; it cannot be polarized"
             )
         self.control_sites += 1
+        self.control_usable_draws += int(oriented)
+        self.control_unusable_draws += int(self._present[index] - row.sum())
+        self.control_unusable_draws += int(row.sum() - oriented)
         return ref_calls / oriented
 
 
@@ -636,19 +723,114 @@ def _validate_provenance(target: Path, matches: Path) -> tuple[dict, dict, str]:
 
 
 def calculate(args: argparse.Namespace) -> None:
+    if args.min_null_replicates < 2:
+        raise ValueError("--min-null-replicates must be at least 2 for a Z-score")
     target_meta, match_meta, target_digest = _validate_provenance(args.target, args.matches)
     match_schema = match_meta.get("schema_version")
+    if match_schema != "bootstrap-target-matches-v1":
+        raise ValueError(
+            "Wasserstein Phi-SFS requires bootstrap-target-matches-v1; "
+            f"received {match_schema!r}"
+        )
+    if match_meta.get("phi_sfs_selection_blind") is not True:
+        raise ValueError("matched controls must be selected without allele-frequency information")
+    match_config = match_meta.get("config")
+    if not isinstance(match_config, dict) or match_config.get("disjoint_replicates") is not True:
+        raise ValueError("matched controls must be generated with --disjoint-replicates")
+    if match_meta.get("maximum_control_reuse") != 1:
+        raise ValueError("matched-control metadata must report maximum_control_reuse equal to 1")
+
     te_chrom, te_pos, snp_chrom, snp_pos, identifiers = _load_coordinates(
         args.target, args.matches, match_schema
     )
     identifier_names = list(identifiers)
+    replicate_ids = identifiers["replicate_id"]
+    if np.unique(replicate_ids).size != replicate_ids.size:
+        raise ValueError("matched-control replicate_id values must be unique")
+    reference_hits = np.flatnonzero(replicate_ids == args.reference_replicate)
+    if reference_hits.size != 1:
+        raise ValueError(
+            f"reference replicate ID {args.reference_replicate} is absent from matches"
+        )
+
+    qc_pass = np.load(args.matches / "qc_pass.npy", allow_pickle=False)
+    if qc_pass.dtype.kind != "b" or qc_pass.shape != replicate_ids.shape:
+        raise ValueError("qc_pass.npy must be a boolean array aligned with matched sets")
+    reference_source_index = int(reference_hits[0])
+    if not bool(qc_pass[reference_source_index]):
+        raise ValueError(f"reference replicate ID {args.reference_replicate} failed matching QC")
+    accepted_source_indices = np.flatnonzero(qc_pass)
+    null_count = int(accepted_source_indices.size - 1)
+    if null_count < args.min_null_replicates:
+        raise ValueError(
+            f"only {null_count} QC-passing null replicates remain after reserving "
+            f"B0; --min-null-replicates requires {args.min_null_replicates}"
+        )
+    reference_index = int(np.flatnonzero(
+        accepted_source_indices == reference_source_index
+    )[0])
+    null_indices = np.delete(np.arange(accepted_source_indices.size), reference_index)
+
+    match_rows = _load_integers(args.matches / "row_indices.npy", "matched row indices")
+    if match_rows.shape != snp_pos.shape:
+        raise ValueError("matched row indices do not align with matched positions")
+    if np.unique(match_rows).size != match_rows.size:
+        raise ValueError("disjoint matched bundle contains a control used more than once")
+    target_rows = _load_integers(args.target / "te_row_indices.npy", "target row indices")
+    if np.intersect1d(target_rows, match_rows).size:
+        raise ValueError("matched B controls must exclude every row in focal set A")
+    reuse_counts = _load_integers(args.matches / "reuse_counts.npy", "reuse counts")
+    if reuse_counts.ndim != 1 or reuse_counts.size == 0 or int(reuse_counts.max()) != 1:
+        raise ValueError("reuse_counts.npy must verify maximum control reuse equal to 1")
+
+    def aligned_match_array(name: str) -> np.ndarray:
+        values = np.load(args.matches / f"{name}.npy", allow_pickle=False)
+        if values.shape[:1] != replicate_ids.shape:
+            raise ValueError(f"{name}.npy does not align with matched sets")
+        return values
+
+    match_to_bootstrap = aligned_match_array("match_to_bootstrap_w1").astype(np.float64)
+    match_error_ratio = aligned_match_array("matching_error_ratio").astype(np.float64)
+    bootstrap_to_observed = aligned_match_array("bootstrap_to_observed_w1").astype(np.float64)
+    bootstrap_seeds = aligned_match_array("bootstrap_seeds")
+    bootstrap_counts = aligned_match_array("bootstrap_counts")
+
     te_coordinates = list(zip(te_chrom.tolist(), te_pos.tolist()))
-    snp_coordinates = [
+    all_snp_coordinates = [
         list(zip(snp_chrom[row].tolist(), snp_pos[row].tolist()))
         for row in range(snp_pos.shape[0])
     ]
-    if not snp_coordinates:
+    if not all_snp_coordinates:
         raise ValueError("matched-control bundle contains no sets")
+    if not te_coordinates:
+        raise ValueError("target contains no A sites")
+    site_count = len(te_coordinates)
+    if snp_pos.shape[1] != site_count:
+        raise ValueError(
+            f"matched sets contain {snp_pos.shape[1]} sites but A contains {site_count}; "
+            "rebuild the target and controls with the shared eligibility mask"
+        )
+    if bootstrap_counts.shape != (replicate_ids.size, site_count):
+        raise ValueError("bootstrap_counts.npy does not align with matched sets and M")
+    if bootstrap_counts.dtype.kind not in "iu" or np.any(bootstrap_counts < 0):
+        raise ValueError("bootstrap_counts.npy must contain nonnegative integers")
+    if np.any(bootstrap_counts.sum(axis=1) != site_count):
+        raise ValueError("every bootstrap count vector must sum to M")
+    if bootstrap_seeds.dtype.kind not in "iu":
+        raise ValueError("bootstrap_seeds.npy must contain integers")
+    for name, values in (
+        ("match_to_bootstrap_w1", match_to_bootstrap),
+        ("matching_error_ratio", match_error_ratio),
+        ("bootstrap_to_observed_w1", bootstrap_to_observed),
+    ):
+        selected = values[accepted_source_indices]
+        if not np.all(np.isfinite(selected)) or np.any(selected < 0.0):
+            raise ValueError(f"QC-passing {name}.npy values must be finite and nonnegative")
+    snp_coordinates = [all_snp_coordinates[index] for index in accepted_source_indices]
+    selected_identifiers = {
+        name: values[accepted_source_indices] for name, values in identifiers.items()
+    }
+
     requested = set(te_coordinates)
     for row in snp_coordinates:
         requested.update(row)
@@ -721,7 +903,7 @@ def calculate(args: argparse.Namespace) -> None:
     present_counts = _checked_table_array(
         table / "present_draw_count.npy", (store_positions.size,))
     polarity = PolarityResolver(
-        set(te_coordinates),
+        set(te_coordinates) if args.a_type == "TE" else set(),
         store_positions=store_positions,
         chromosome_offsets=chromosome_offsets,
         ancestral_counts=_checked_table_array(
@@ -737,7 +919,7 @@ def calculate(args: argparse.Namespace) -> None:
     )
     print(
         f"polarity: {polarity.te_sites:,} TE sites from biology, "
-        f"{polarity.control_sites:,} control sites from the ancestral table",
+        f"{polarity.control_sites:,} SNP sites from the ancestral table",
         flush=True,
     )
     missing = sorted(requested.difference(counts))
@@ -752,48 +934,116 @@ def calculate(args: argparse.Namespace) -> None:
         flush=True,
     )
 
-    te_counts, te_endpoint, te_eligible = accumulate_spectrum(
+    a_counts, a_endpoint, a_eligible = accumulate_spectrum(
         te_coordinates, site_rows, projections, endpoints
     )
-    te_raw, te_normalized = normalized_spectrum(te_counts)
+    if a_eligible != site_count:
+        raise ValueError(
+            f"A retains {a_eligible} of {site_count} sites after callability filtering; "
+            "rebuild the target and controls with the shared eligibility mask"
+        )
+    a_raw, a_normalized = normalized_spectrum(a_counts)
 
-    replicate_raw = np.empty((len(snp_coordinates), PROJECTION_SIZE - 1), dtype=np.float64)
-    replicate_normalized = np.empty_like(replicate_raw)
-    residuals = np.empty_like(replicate_raw)
-    positive = np.empty_like(replicate_raw)
-    phi = np.empty(len(snp_coordinates), dtype=np.float64)
-    rows: list[dict[str, object]] = []
+    b_raw = np.empty((len(snp_coordinates), PROJECTION_SIZE - 1), dtype=np.float64)
+    b_normalized = np.empty_like(b_raw)
+    b_endpoints = np.empty(len(snp_coordinates), dtype=np.float64)
 
     for replicate, coordinates in enumerate(snp_coordinates):
         counts_vector, endpoint, eligible = accumulate_spectrum(
             coordinates, site_rows, projections, endpoints
         )
+        if eligible != site_count:
+            replicate_id = int(selected_identifiers["replicate_id"][replicate])
+            raise ValueError(
+                f"B replicate {replicate_id} retains {eligible} of {site_count} sites "
+                "after callability filtering; rebuild the target and controls with "
+                "the shared eligibility mask"
+            )
         raw, normalized = normalized_spectrum(counts_vector)
-        result = phi_sfs(te_normalized, normalized)
-        replicate_raw[replicate] = raw
-        replicate_normalized[replicate] = normalized
-        residuals[replicate] = result.residual
-        positive[replicate] = result.positive
-        phi[replicate] = result.value
-        retained_mass = float(raw.sum())
-        rows.append({
-            "replicate": replicate,
-            **{name: int(identifiers[name][replicate]) for name in identifier_names},
-            "input_sites": len(coordinates),
-            "eligible_sites": eligible,
-            "dropped_n_lt_20": len(coordinates) - eligible,
-            "retained_mass": retained_mass,
-            "endpoint_mass": endpoint,
-            "retained_fraction": retained_mass / eligible,
-            "endpoint_fraction": endpoint / eligible,
-            "phi_sfs": result.value,
-            "overlap": 1.0 - result.value,
-            "reverse_positive": result.reverse_positive,
-            "half_l1": result.half_l1,
-            "identity_max_abs_error": max(
-                abs(result.value - result.reverse_positive),
-                abs(result.value - result.half_l1),
-            ),
+        b_raw[replicate] = raw
+        b_normalized[replicate] = normalized
+        b_endpoints[replicate] = endpoint
+
+    daf = RETAINED_BINS.astype(np.float64) / PROJECTION_SIZE
+    b_cdf = np.cumsum(b_normalized, axis=1)
+    reference_sfs = b_normalized[reference_index]
+    reference_cdf = b_cdf[reference_index]
+    observed_result = phi_sfs(a_normalized, reference_sfs, daf=daf)
+    null_phi = (
+        np.abs(b_cdf[null_indices, :-1] - reference_cdf[:-1])
+        * np.diff(daf)
+    ).sum(axis=1)
+    calibration = calibrate_phi(observed_result.value, null_phi)
+    null_mean_daf_difference = (
+        (b_normalized[null_indices] - reference_sfs) @ daf
+    )
+
+    selected_rows = match_rows[accepted_source_indices]
+    reference_rows = selected_rows[reference_index]
+    overlaps = np.asarray([
+        np.intersect1d(selected_rows[index], reference_rows).size
+        for index in null_indices
+    ], dtype=np.int64)
+    if np.any(overlaps != 0):
+        raise ValueError("a null matched set overlaps B0 despite disjoint mode")
+
+    selected_source = accepted_source_indices
+    reference_source = int(selected_source[reference_index])
+    reference_id = int(selected_identifiers["replicate_id"][reference_index])
+    a_retained_mass = float(a_raw.sum())
+    reference_retained_mass = float(b_raw[reference_index].sum())
+
+    comparison_rows: list[dict[str, object]] = [{
+        "role": "observed",
+        "left_id": "A",
+        "left_type": args.a_type,
+        "right_id": reference_id,
+        "right_type": args.b_type,
+        "phi_sfs": observed_result.value,
+        "null_z_score": "",
+        "mean_daf_difference": observed_result.mean_daf_difference,
+        "left_sites": site_count,
+        "right_sites": site_count,
+        "left_retained_mass": a_retained_mass,
+        "right_retained_mass": reference_retained_mass,
+        "left_endpoint_mass": a_endpoint,
+        "right_endpoint_mass": b_endpoints[reference_index],
+        "left_matching_qc_pass": "",
+        "left_bootstrap_to_observed_w1": "",
+        "left_match_to_bootstrap_w1": "",
+        "left_matching_error_ratio": "",
+        "right_matching_qc_pass": True,
+        "right_bootstrap_to_observed_w1": bootstrap_to_observed[reference_source],
+        "right_match_to_bootstrap_w1": match_to_bootstrap[reference_source],
+        "right_matching_error_ratio": match_error_ratio[reference_source],
+        "overlap_with_reference": "",
+    }]
+    for null_offset, accepted_index in enumerate(null_indices):
+        source_index = int(selected_source[accepted_index])
+        comparison_rows.append({
+            "role": "null",
+            "left_id": int(selected_identifiers["replicate_id"][accepted_index]),
+            "left_type": args.b_type,
+            "right_id": reference_id,
+            "right_type": args.b_type,
+            "phi_sfs": calibration.null[null_offset],
+            "null_z_score": calibration.null_z_scores[null_offset],
+            "mean_daf_difference": null_mean_daf_difference[null_offset],
+            "left_sites": site_count,
+            "right_sites": site_count,
+            "left_retained_mass": float(b_raw[accepted_index].sum()),
+            "right_retained_mass": reference_retained_mass,
+            "left_endpoint_mass": b_endpoints[accepted_index],
+            "right_endpoint_mass": b_endpoints[reference_index],
+            "left_matching_qc_pass": True,
+            "left_bootstrap_to_observed_w1": bootstrap_to_observed[source_index],
+            "left_match_to_bootstrap_w1": match_to_bootstrap[source_index],
+            "left_matching_error_ratio": match_error_ratio[source_index],
+            "right_matching_qc_pass": True,
+            "right_bootstrap_to_observed_w1": bootstrap_to_observed[reference_source],
+            "right_match_to_bootstrap_w1": match_to_bootstrap[reference_source],
+            "right_matching_error_ratio": match_error_ratio[reference_source],
+            "overlap_with_reference": int(overlaps[null_offset]),
         })
 
     output = args.output
@@ -804,46 +1054,61 @@ def calculate(args: argparse.Namespace) -> None:
     try:
         arrays = {
             "bins.npy": RETAINED_BINS,
-            "te_raw_sfs.npy": te_raw,
-            "te_normalized_sfs.npy": te_normalized,
-            "snp_raw_sfs.npy": replicate_raw,
-            "snp_normalized_sfs.npy": replicate_normalized,
-            "residual_te_minus_snp.npy": residuals,
-            "positive_te_residual.npy": positive,
-            "phi_sfs.npy": phi,
-            **{f"{name}.npy": values for name, values in identifiers.items()},
+            "daf.npy": daf,
+            "a_raw_sfs.npy": a_raw,
+            "a_normalized_sfs.npy": a_normalized,
+            "a_cdf.npy": observed_result.cdf_a,
+            "b_raw_sfs.npy": b_raw,
+            "b_normalized_sfs.npy": b_normalized,
+            "b_cdf.npy": b_cdf,
+            "reference_sfs.npy": reference_sfs,
+            "reference_cdf.npy": reference_cdf,
+            "observed_phi_sfs.npy": np.asarray(observed_result.value),
+            "null_phi_sfs.npy": calibration.null,
+            "null_z_scores.npy": calibration.null_z_scores,
+            "observed_bin_residual.npy": observed_result.bin_residual,
+            "observed_cdf_residual.npy": observed_result.cdf_residual,
+            "reference_replicate_id.npy": np.asarray(reference_id, dtype=np.int64),
+            "b_bootstrap_seeds.npy": bootstrap_seeds[selected_source],
+            "b_bootstrap_counts.npy": bootstrap_counts[selected_source],
+            **{
+                f"b_{name}.npy": values
+                for name, values in selected_identifiers.items()
+            },
+            **{
+                f"null_{name}.npy": values[null_indices]
+                for name, values in selected_identifiers.items()
+            },
         }
         for name, values in arrays.items():
             np.save(staging / name, values, allow_pickle=False)
-        with (staging / "replicates.csv").open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+
+        summary_row = {
+            "focal_label": args.target.name,
+            "target_digest": target_digest,
+            "a_type": args.a_type,
+            "b_type": args.b_type,
+            "site_count_m": site_count,
+            "null_replicates_r": null_count,
+            "reference_replicate_id": reference_id,
+            "observed_phi_sfs": calibration.observed,
+            "null_mean": calibration.null_mean,
+            "null_sample_sd": calibration.null_sd,
+            "z_score": calibration.z_score,
+            "exceedances": calibration.exceedances,
+            "p_value": calibration.p_value,
+            "minimum_attainable_p": 1.0 / (null_count + 1.0),
+            "mean_daf_difference": observed_result.mean_daf_difference,
+        }
+        with (staging / "summary.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(summary_row))
             writer.writeheader()
-            writer.writerows(rows)
-        with (staging / "bins.csv").open("w", newline="", encoding="utf-8") as handle:
-            fields = [
-                "replicate", *identifier_names, "derived_count_bin",
-                "te_raw", "te_normalized", "snp_raw", "snp_normalized",
-                "te_minus_snp", "positive_te_residual",
-            ]
-            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writerow(summary_row)
+        with (staging / "comparisons.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(comparison_rows[0]))
             writer.writeheader()
-            for replicate in range(len(rows)):
-                for offset, bin_index in enumerate(RETAINED_BINS):
-                    writer.writerow({
-                        "replicate": replicate,
-                        **{
-                            name: int(identifiers[name][replicate])
-                            for name in identifier_names
-                        },
-                        "derived_count_bin": int(bin_index),
-                        "te_raw": float(te_raw[offset]),
-                        "te_normalized": float(te_normalized[offset]),
-                        "snp_raw": float(replicate_raw[replicate, offset]),
-                        "snp_normalized": float(replicate_normalized[replicate, offset]),
-                        "te_minus_snp": float(residuals[replicate, offset]),
-                        "positive_te_residual": float(positive[replicate, offset]),
-                    })
-        te_retained_mass = float(te_raw.sum())
+            writer.writerows(comparison_rows)
+
         metadata = {
             "schema_version": SCHEMA_VERSION,
             "complete": True,
@@ -853,33 +1118,37 @@ def calculate(args: argparse.Namespace) -> None:
             "numpy_version": np.__version__,
             "projection_size": PROJECTION_SIZE,
             "retained_bins": [1, 19],
+            "daf_grid": daf.tolist(),
             "site_projection_renormalized": False,
             "final_spectra_normalized": True,
-            "phi_definition": "sum(max(te_normalized_sfs - snp_normalized_sfs, 0))",
-            "phi_equivalent_forms": [
-                "sum(max(snp_normalized_sfs - te_normalized_sfs, 0))",
-                "0.5 * sum(abs(te_normalized_sfs - snp_normalized_sfs))",
-                "1 - sum(minimum(te_normalized_sfs, snp_normalized_sfs))",
-            ],
+            "phi_definition": "sum(abs(cdf_a[:-1] - cdf_b[:-1]) * diff(daf))",
             "phi_interpretation": (
-                "total variation distance between the projected normalized spectra; "
-                "symmetric and bounded in [0, 1]"
+                "one-dimensional Wasserstein distance between projected normalized SFS"
             ),
+            "a_type": args.a_type,
+            "b_type": args.b_type,
             "target": str(args.target.resolve()),
+            "target_schema_version": target_meta.get("schema_version"),
             "matches": str(args.matches.resolve()),
             "matches_schema_version": match_schema,
             "replicate_identifiers": identifier_names,
             "target_digest": target_digest,
             "vcf": str(args.vcf.resolve()),
             "vcf_sha256": vcf_sha256,
-            "polarity_source": (
-                "TE sites: insertion is derived (biological); control SNPs: "
-                "posterior-weighted mixture over ARG ancestral calls, "
-                "conditioned on presence, used uncalibrated"
+            "a_polarity_rule": (
+                "insertion presence is derived after upstream at-least-50%-derived "
+                "retention" if args.a_type == "TE" else
+                "posterior q*h(k,n) + (1-q)*h(n-k,n) over usable ARG draws"
+            ),
+            "b_polarity_rule": (
+                "posterior q*h(k,n) + (1-q)*h(n-k,n) over usable ARG draws"
             ),
             "ancestral_table": str(Path(args.ancestral_table).resolve()),
+            "ancestral_table_schema_version": store_meta.get("schema_version"),
             "te_sites_polarized": polarity.te_sites,
-            "control_sites_polarized": polarity.control_sites,
+            "snp_sites_polarized": polarity.control_sites,
+            "snp_usable_arg_draws": polarity.control_usable_draws,
+            "snp_unusable_arg_draws": polarity.control_unusable_draws,
             "ancestral_case_policy": (
                 "case-sensitive; a lowercase ancestral allele is rejected rather than folded"
             ),
@@ -891,15 +1160,46 @@ def calculate(args: argparse.Namespace) -> None:
                 "the VCF FILTER column is ignored; every record at a requested "
                 "coordinate is used"
             ),
-            "replicates": len(rows),
+            "reference_selection_rule": "prespecified --reference-replicate before SFS scan",
+            "reference_replicate_id": reference_id,
+            "reference_index_in_b_arrays": reference_index,
+            "reference_bootstrap_seed": int(bootstrap_seeds[reference_source]),
+            "reference_bootstrap_counts_array": "b_bootstrap_counts.npy",
+            "requested_minimum_null_replicates": args.min_null_replicates,
+            "accepted_null_replicates": null_count,
+            "null_standard_deviation_ddof": 1,
+            "p_value_tail_rule": "null distance >= observed distance",
+            "p_value_formula": "(1 + exceedances) / (R + 1)",
+            "observed_phi_sfs": calibration.observed,
+            "null_mean": calibration.null_mean,
+            "null_sample_sd": calibration.null_sd,
+            "z_score": calibration.z_score,
+            "p_value": calibration.p_value,
+            "exceedances": calibration.exceedances,
+            "matched_sets_passing_qc_including_reference": int(selected_source.size),
             "distinct_projections": int(projections.shape[0]),
-            "target_input_sites": len(te_coordinates),
-            "target_eligible_sites": te_eligible,
-            "target_dropped_n_lt_20": len(te_coordinates) - te_eligible,
-            "target_retained_mass": te_retained_mass,
-            "target_endpoint_mass": te_endpoint,
-            "target_retained_fraction": te_retained_mass / te_eligible,
-            "target_endpoint_fraction": te_endpoint / te_eligible,
+            "equal_eligible_site_count": site_count,
+            "a_input_sites": len(te_coordinates),
+            "a_eligible_sites": a_eligible,
+            "a_retained_mass": a_retained_mass,
+            "a_endpoint_mass": a_endpoint,
+            "a_retained_fraction": a_retained_mass / a_eligible,
+            "a_endpoint_fraction": a_endpoint / a_eligible,
+            "matching_qc_rule": "source qc_pass.npy; only passing sets analyzed",
+            "matching_algorithm_same_for_reference_and_null": True,
+            "matching_phi_sfs_selection_blind": True,
+            "disjoint_replicates": True,
+            "maximum_control_reuse": 1,
+            "maximum_overlap_with_reference": int(overlaps.max(initial=0)),
+            "bootstrap_to_observed_w1_range": [
+                float(bootstrap_to_observed[selected_source].min()),
+                float(bootstrap_to_observed[selected_source].max()),
+            ],
+            "matching_error_ratio_range": [
+                float(match_error_ratio[selected_source].min()),
+                float(match_error_ratio[selected_source].max()),
+            ],
+            "reference_sensitivity_run": False,
             "target_source_store_content_sha256": target_meta.get("source_store_content_sha256"),
             "matches_source_store_content_sha256": match_meta.get("source_store_content_sha256"),
         }
@@ -924,10 +1224,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True,
                         help="destination directory for spectra and scores")
     parser.add_argument(
+        "-A", "--a-type", choices=("TE", "SNP"), default="TE",
+        help="variant type of focal set A (default: TE)",
+    )
+    parser.add_argument(
+        "-B", "--b-type", choices=("SNP",), default="SNP",
+        help="variant type of every matched control set B (default: SNP)",
+    )
+    parser.add_argument(
+        "--reference-replicate", type=int, default=0,
+        help="prespecified matched replicate ID to hold fixed as B0 (default: 0)",
+    )
+    parser.add_argument(
+        "--min-null-replicates", type=int, default=1000,
+        help="minimum QC-passing B_i sets after reserving B0 (default: 1000)",
+    )
+    parser.add_argument(
         "--ancestral-table", type=Path, required=True,
-        help="directory written by normalize_tes.build_ancestral_states, giving each "
-             "control SNP's posterior polarity; TE sites are polarized by "
-             "biology and do not consult it",
+        help="directory written by normalize_tes.build_ancestral_states, giving SNP "
+             "sites their posterior polarity; A uses it when --a-type SNP",
     )
     parser.add_argument("--heterozygous", choices=("error", "missing"), default="error",
                         help="how to treat a heterozygous call in these inbred "

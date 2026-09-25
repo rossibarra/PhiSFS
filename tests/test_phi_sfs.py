@@ -8,6 +8,7 @@ import pytest
 from normalize_tes.phi_sfs import (
     SiteCount,
     accumulate_spectrum,
+    calibrate_phi,
     hypergeometric_projection,
     main,
     normalized_spectrum,
@@ -125,34 +126,122 @@ def test_zero_retained_mass_fails():
 # ------------------------------------------------------------------ the score
 
 
-def test_phi_identities():
-    te = np.zeros(19)
-    snp = np.zeros(19)
-    te[0], snp[1] = 1, 1
-    result = phi_sfs(te, snp)
-    assert result.value == pytest.approx(1)
-    assert result.positive.sum() == pytest.approx(1)
-    assert result.reverse_positive == pytest.approx(result.value)
-    assert result.half_l1 == pytest.approx(result.value)
-    assert phi_sfs(te, te).value == pytest.approx(0)
+def test_phi_is_wasserstein_distance_and_symmetric():
+    a = np.zeros(19)
+    b = np.zeros(19)
+    a[0], b[-1] = 1, 1
+    result = phi_sfs(a, b)
+    assert result.value == pytest.approx(18 / 20)
+    assert result.mean_daf_difference == pytest.approx(-18 / 20)
+    np.testing.assert_allclose(result.cdf_a, np.ones(19))
+    np.testing.assert_allclose(result.cdf_b[:-1], np.zeros(18))
+    np.testing.assert_allclose(result.cdf_residual, result.cdf_a - result.cdf_b)
+    np.testing.assert_allclose(result.bin_residual, a - b)
+    assert phi_sfs(a, a).value == pytest.approx(0)
+    assert phi_sfs(b, a).value == pytest.approx(result.value)
+    assert phi_sfs(b, a).mean_daf_difference == pytest.approx(
+        -result.mean_daf_difference
+    )
 
 
-def test_phi_is_total_variation_distance_and_symmetric():
+def test_phi_matches_cdf_area_on_an_irregular_grid():
+    a = np.array([0.5, 0.0, 0.5])
+    b = np.array([0.0, 1.0, 0.0])
+    daf = np.array([0.1, 0.4, 0.9])
+    # The CDF difference is +0.5 over [0.1, 0.4), then -0.5 over
+    # [0.4, 0.9), so the total shaded area is 0.4.
+    result = phi_sfs(a, b, daf=daf)
+    assert result.value == pytest.approx(0.4)
+    assert result.mean_daf_difference == pytest.approx(0.1)
+
+
+def test_phi_random_spectra_are_symmetric_and_nonnegative():
     rng = np.random.default_rng(1)
     for _ in range(5):
-        te = rng.random(19)
-        te /= te.sum()
-        snp = rng.random(19)
-        snp /= snp.sum()
-        value = phi_sfs(te, snp).value
-        assert value == pytest.approx(1 - np.minimum(te, snp).sum())
-        assert value == pytest.approx(phi_sfs(snp, te).value)
-        assert 0 <= value <= 1
+        a = rng.random(19)
+        a /= a.sum()
+        b = rng.random(19)
+        b /= b.sum()
+        value = phi_sfs(a, b).value
+        assert value == pytest.approx(phi_sfs(b, a).value)
+        assert value >= 0
 
 
-def test_phi_rejects_unnormalized_input():
-    with pytest.raises(ValueError, match="normalized"):
-        phi_sfs(np.full(19, 0.1), np.full(19, 1 / 19))
+@pytest.mark.parametrize(
+    ("a", "b", "daf", "message"),
+    [
+        (np.ones((1, 19)) / 19, np.ones(19) / 19, None, "one-dimensional"),
+        (np.ones(18) / 18, np.ones(19) / 19, None, "equal length"),
+        (np.r_[np.nan, np.ones(18)], np.ones(19) / 19, None, "finite"),
+        (
+            np.r_[-0.1, np.repeat(1.1 / 18, 18)],
+            np.ones(19) / 19,
+            None,
+            "nonnegative",
+        ),
+        (np.full(19, 0.1), np.full(19, 1 / 19), None, "normalized"),
+        (
+            np.ones(3) / 3,
+            np.ones(3) / 3,
+            np.array([0.1, 0.1, 0.9]),
+            "strictly increasing",
+        ),
+    ],
+)
+def test_phi_rejects_invalid_input(a, b, daf, message):
+    with pytest.raises(ValueError, match=message):
+        phi_sfs(a, b, daf=daf)
+
+
+def test_phi_requires_explicit_grid_for_nondefault_spectra():
+    with pytest.raises(ValueError, match="daf is required"):
+        phi_sfs(np.ones(3) / 3, np.ones(3) / 3)
+
+
+# ----------------------------------------------------------- null calibration
+
+
+def test_calibrate_phi_uses_sample_sd_and_add_one_p_value():
+    result = calibrate_phi(0.4, np.array([0.1, 0.2, 0.3]))
+    assert result.observed == pytest.approx(0.4)
+    np.testing.assert_allclose(result.null, [0.1, 0.2, 0.3])
+    assert result.null_mean == pytest.approx(0.2)
+    assert result.null_sd == pytest.approx(0.1)
+    assert result.z_score == pytest.approx(2.0)
+    assert result.exceedances == 0
+    assert result.p_value == pytest.approx(1 / 4)
+    np.testing.assert_allclose(result.null_z_scores, [-1.0, 0.0, 1.0], atol=1e-15)
+    assert result.null_z_scores.mean() == pytest.approx(0.0, abs=1e-15)
+    assert result.null_z_scores.std(ddof=1) == pytest.approx(1.0)
+
+    permuted = calibrate_phi(0.4, np.array([0.3, 0.1, 0.2]))
+    assert permuted.null_mean == pytest.approx(result.null_mean)
+    assert permuted.null_sd == pytest.approx(result.null_sd)
+    assert permuted.z_score == pytest.approx(result.z_score)
+    assert permuted.p_value == pytest.approx(result.p_value)
+
+
+def test_calibrate_phi_counts_ties_as_exceedances():
+    result = calibrate_phi(0.2, np.array([0.1, 0.2, 0.3]))
+    assert result.exceedances == 2
+    assert result.p_value == pytest.approx(3 / 4)
+
+
+@pytest.mark.parametrize(
+    ("observed", "null", "message"),
+    [
+        (-0.1, np.array([0.1, 0.2]), "observed.*nonnegative"),
+        (np.nan, np.array([0.1, 0.2]), "observed.*finite"),
+        (0.1, np.array([[0.1, 0.2]]), "one-dimensional"),
+        (0.1, np.array([0.1]), "at least two"),
+        (0.1, np.array([0.1, np.inf]), "null.*finite"),
+        (0.1, np.array([0.1, -0.2]), "null.*nonnegative"),
+        (0.1, np.array([0.2, 0.2]), "zero sample standard deviation"),
+    ],
+)
+def test_calibrate_phi_rejects_invalid_input(observed, null, message):
+    with pytest.raises(ValueError, match=message):
+        calibrate_phi(observed, null)
 
 
 # -------------------------------------------------------------- the fixtures
@@ -176,16 +265,29 @@ def _write_bundle(root: Path, *, positions=None, row_indices=None, target_digest
     np.save(target / "age_bins.npy", ages, allow_pickle=False)
 
     if positions is None:
-        positions = np.array([[30, 40], [40, 50]])
+        positions = np.array([[30, 40], [50, 60], [70, 80]])
     if row_indices is None:
-        row_indices = np.array([[2, 3], [3, 4]], dtype=np.int64)
+        row_indices = np.array([[2, 3], [4, 5], [6, 7]], dtype=np.int64)
     np.save(matches / "positions.npy", np.asarray(positions), allow_pickle=False)
     np.save(matches / "row_indices.npy", np.asarray(row_indices), allow_pickle=False)
     np.save(matches / "chromosome_codes.npy",
             np.zeros(np.shape(positions), dtype=np.uint16), allow_pickle=False)
     np.save(matches / "chromosome_labels.npy", np.array(["chr1"]), allow_pickle=False)
-    np.save(matches / "chain_index.npy", np.array([0, 1]), allow_pickle=False)
-    np.save(matches / "sample_index.npy", np.array([3, 4]), allow_pickle=False)
+    replicate_count = np.shape(positions)[0]
+    np.save(matches / "replicate_id.npy", np.arange(replicate_count), allow_pickle=False)
+    np.save(matches / "qc_pass.npy", np.ones(replicate_count, dtype=bool), allow_pickle=False)
+    np.save(matches / "match_to_bootstrap_w1.npy",
+            np.linspace(0.01, 0.03, replicate_count), allow_pickle=False)
+    np.save(matches / "matching_error_ratio.npy",
+            np.linspace(0.1, 0.3, replicate_count), allow_pickle=False)
+    np.save(matches / "bootstrap_to_observed_w1.npy",
+            np.linspace(0.1, 0.2, replicate_count), allow_pickle=False)
+    np.save(matches / "bootstrap_seeds.npy",
+            np.arange(100, 100 + replicate_count, dtype=np.uint64), allow_pickle=False)
+    np.save(matches / "bootstrap_counts.npy",
+            np.ones((replicate_count, te_rows.size), dtype=np.uint32), allow_pickle=False)
+    np.save(matches / "reuse_counts.npy",
+            np.ones(np.size(row_indices), dtype=np.uint16), allow_pickle=False)
 
     digest = _sha256_arrays(
         te_rows, cdf, ages, np.asarray([threshold], dtype=np.float64)
@@ -196,11 +298,14 @@ def _write_bundle(root: Path, *, positions=None, row_indices=None, target_digest
         "wasserstein_threshold_generations": threshold,
     }))
     (matches / "metadata.json").write_text(json.dumps({
-        "schema_version": "swap-age-matched-controls-v1",
+        "schema_version": "bootstrap-target-matches-v1",
         "source_store_content_sha256": "store",
         "source_catalog_sha256": "catalog",
         "complete": True,
         "target_digest": target_digest if target_digest is not None else digest,
+        "phi_sfs_selection_blind": True,
+        "maximum_control_reuse": 1,
+        "config": {"disjoint_replicates": True},
     }))
     return target, matches
 
@@ -216,13 +321,15 @@ def _record(position: int, derived: int, *, callable_count: int = 20, info: str 
 
 
 def _vcf_text(info: str = "."):
-    # Site 50 has only ten callable individuals, so it fails the n >= 20 filter.
     records = [
         _record(10, 4, info=info),
         _record(20, 8, info=info),
         _record(30, 4, info=info),
         _record(40, 12, info=info),
-        _record(50, 5, callable_count=10, info=info),
+        _record(50, 8, info=info),
+        _record(60, 12, info=info),
+        _record(70, 1, info=info),
+        _record(80, 19, info=info),
     ]
     header = (
         "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
@@ -232,7 +339,7 @@ def _vcf_text(info: str = "."):
     return header + "\n".join(records) + "\n"
 
 
-def _ancestral_table(tmp_path, positions=(10, 20, 30, 40, 50)):
+def _ancestral_table(tmp_path, positions=(10, 20, 30, 40, 50, 60, 70, 80)):
     """A table asserting REF (`A`) is ancestral at every site, unanimously.
 
     Every record in `_vcf_text` is `A`/`G`, so an ancestral call of `A` makes the
@@ -270,7 +377,8 @@ def _ancestral_table(tmp_path, positions=(10, 20, 30, 40, 50)):
 def _run(target, matches, vcf, output, *extra):
     argv = [
         "--target", str(target), "--matches", str(matches),
-        "--vcf", str(vcf), "--output", str(output), *extra,
+        "--vcf", str(vcf), "--output", str(output),
+        "--min-null-replicates", "2", *extra,
     ]
     if "--ancestral-table" not in argv:
         argv += ["--ancestral-table", str(_ancestral_table(Path(output).parent))]
@@ -283,10 +391,9 @@ def _run(target, matches, vcf, output, *extra):
 def test_end_to_end_matches_hand_calculation(tmp_path):
     """Every site has n = 20, so each projects to a point mass at its own k.
 
-    The TE set is k = 4 and k = 8, so t is 0.5 at bins 4 and 8. Replicate 0 is
-    k = 4 and k = 12, so it shares only the bin-4 mass and Phi is 0.5.
-    Replicate 1 keeps only k = 12 once site 50 is dropped, so it shares nothing
-    with the target and Phi is 1.
+    A is k = 4 and 8. B0 is k = 4 and 12, so half the mass moves four
+    DAF bins and observed Phi is 0.5 * (4 / 20) = 0.1. The two null sets
+    give distances 0.1 and 0.25 from B0.
     """
     target, matches = _write_bundle(tmp_path)
     vcf = tmp_path / "sites.vcf"
@@ -297,25 +404,30 @@ def test_end_to_end_matches_hand_calculation(tmp_path):
     bins = np.load(output / "bins.npy")
     assert bins.tolist() == list(range(1, 20))
 
-    te = np.load(output / "te_normalized_sfs.npy")
-    assert te[3] == pytest.approx(0.5)   # bin 4
-    assert te[7] == pytest.approx(0.5)   # bin 8
-    assert te.sum() == pytest.approx(1)
+    a = np.load(output / "a_normalized_sfs.npy")
+    assert a[3] == pytest.approx(0.5)   # bin 4
+    assert a[7] == pytest.approx(0.5)   # bin 8
+    assert a.sum() == pytest.approx(1)
 
-    snp = np.load(output / "snp_normalized_sfs.npy")
-    assert snp[0][3] == pytest.approx(0.5)
-    assert snp[0][11] == pytest.approx(0.5)   # bin 12
-    assert snp[1][11] == pytest.approx(1.0)
+    b = np.load(output / "b_normalized_sfs.npy")
+    assert b[0][3] == pytest.approx(0.5)
+    assert b[0][11] == pytest.approx(0.5)   # bin 12
+    assert b[1][7] == pytest.approx(0.5)
+    assert b[1][11] == pytest.approx(0.5)
 
-    phi = np.load(output / "phi_sfs.npy")
-    assert phi.tolist() == pytest.approx([0.5, 1.0])
+    assert np.load(output / "observed_phi_sfs.npy").item() == pytest.approx(0.1)
+    assert np.load(output / "null_phi_sfs.npy").tolist() == pytest.approx([0.1, 0.25])
+    assert np.load(output / "reference_replicate_id.npy").item() == 0
+    assert np.load(output / "null_replicate_id.npy").tolist() == [1, 2]
 
-    residual = np.load(output / "residual_te_minus_snp.npy")
-    assert residual[0][7] == pytest.approx(0.5)
-    assert residual[0][11] == pytest.approx(-0.5)
+    residual = np.load(output / "observed_bin_residual.npy")
+    assert residual[7] == pytest.approx(0.5)
+    assert residual[11] == pytest.approx(-0.5)
 
-    assert np.load(output / "chain_index.npy").tolist() == [0, 1]
-    assert len((output / "bins.csv").read_text().splitlines()) == 1 + 2 * 19
+    summary = (output / "summary.csv").read_text().splitlines()
+    assert len(summary) == 2
+    comparisons = (output / "comparisons.csv").read_text().splitlines()
+    assert len(comparisons) == 4
 
 
 def test_end_to_end_metadata_and_diagnostics(tmp_path):
@@ -327,15 +439,19 @@ def test_end_to_end_metadata_and_diagnostics(tmp_path):
 
     metadata = json.loads((output / "metadata.json").read_text())
     assert metadata["complete"] is True
-    assert metadata["replicates"] == 2
-    assert metadata["target_eligible_sites"] == 2
-    assert metadata["target_dropped_n_lt_20"] == 0
+    assert metadata["schema_version"] == "phi-sfs-wasserstein-v1"
+    assert metadata["accepted_null_replicates"] == 2
+    assert metadata["a_eligible_sites"] == 2
+    assert metadata["equal_eligible_site_count"] == 2
+    assert metadata["a_type"] == "TE"
+    assert metadata["b_type"] == "SNP"
+    assert metadata["reference_replicate_id"] == 0
+    assert metadata["maximum_control_reuse"] == 1
+    assert metadata["maximum_overlap_with_reference"] == 0
     # Every eligible site has n = 20, so no mass reaches bins 0 or 20.
-    assert metadata["target_retained_fraction"] == pytest.approx(1)
-    assert metadata["target_endpoint_fraction"] == pytest.approx(0)
-    # Four eligible sites but only three distinct (k, n) pairs: sites 10 and 30
-    # are both k = 4 among n = 20, so they share one cached projection.
-    assert metadata["distinct_projections"] == 3
+    assert metadata["a_retained_fraction"] == pytest.approx(1)
+    assert metadata["a_endpoint_fraction"] == pytest.approx(0)
+    assert metadata["distinct_projections"] == 5
     assert metadata["software"]["name"] == "normalizeTE"
     assert metadata["creation_command"]
     assert metadata["creation_time_utc"]
@@ -345,18 +461,12 @@ def test_end_to_end_metadata_and_diagnostics(tmp_path):
         (matches / "metadata.json").read_text()
     )["target_digest"]
 
-    replicates = (output / "replicates.csv").read_text().splitlines()
-    header = replicates[0].split(",")
-    assert "retained_fraction" in header and "endpoint_fraction" in header
-    second = dict(zip(header, replicates[2].split(",")))
-    assert int(second["input_sites"]) == 2
-    assert int(second["eligible_sites"]) == 1
-    assert int(second["dropped_n_lt_20"]) == 1
-    # Replicate 1 keeps one of its two sites, so the fractions must divide by
-    # the eligible count and not the input count: dividing by input_sites
-    # would give 0.5 here.
-    assert float(second["retained_mass"]) == pytest.approx(1)
-    assert float(second["retained_fraction"]) == pytest.approx(1)
+    summary_header, summary_values = (
+        line.split(",") for line in (output / "summary.csv").read_text().splitlines()
+    )
+    summary = dict(zip(summary_header, summary_values))
+    assert float(summary["observed_phi_sfs"]) == pytest.approx(0.1)
+    assert float(summary["p_value"]) == pytest.approx(1.0)
 
 
 def test_vcf_sha256_matches_a_direct_digest(tmp_path):
@@ -379,7 +489,7 @@ def test_compressed_input_is_read_and_hashed(tmp_path):
     assert _run(target, matches, vcf, tmp_path / "phi") == 0
     metadata = json.loads((tmp_path / "phi" / "metadata.json").read_text())
     assert metadata["vcf_sha256"] == hashlib.sha256(vcf.read_bytes()).hexdigest()
-    assert np.load(tmp_path / "phi" / "phi_sfs.npy").tolist() == pytest.approx([0.5, 1.0])
+    assert np.load(tmp_path / "phi" / "observed_phi_sfs.npy").item() == pytest.approx(0.1)
 
 
 
@@ -396,12 +506,9 @@ def test_heterozygous_missing_policy_drops_the_individual(tmp_path):
     vcf = tmp_path / "sites.vcf"
     # Site 10 loses one derived individual: k = 3 among n = 19, so it is dropped.
     vcf.write_text(_vcf_text().replace("\t1\t", "\t0/1\t", 1))
-    assert _run(target, matches, vcf, tmp_path / "phi",
-                "--heterozygous", "missing") == 0
-    metadata = json.loads((tmp_path / "phi" / "metadata.json").read_text())
-    assert metadata["target_input_sites"] == 2
-    assert metadata["target_eligible_sites"] == 1
-    assert metadata["target_dropped_n_lt_20"] == 1
+    with pytest.raises(ValueError, match="shared eligibility mask"):
+        _run(target, matches, vcf, tmp_path / "phi",
+             "--heterozygous", "missing")
 
 
 
@@ -423,6 +530,56 @@ def test_existing_output_is_never_overwritten(tmp_path):
         _run(target, matches, vcf, output)
 
 
+def test_end_to_end_snp_a_uses_posterior_polarity(tmp_path):
+    target, matches = _write_bundle(tmp_path)
+    vcf = tmp_path / "sites.vcf"
+    vcf.write_text(_vcf_text())
+    table = _ancestral_table(tmp_path)
+    counts = np.load(table / "ancestral_counts.npy")
+    counts[:, 0] = 100
+    counts[:2, 0] = 25
+    counts[:2, 2] = 75
+    np.save(table / "ancestral_counts.npy", counts)
+    np.save(
+        table / "present_draw_count.npy",
+        np.full(counts.shape[0], 100, dtype=np.uint16),
+    )
+
+    output = tmp_path / "phi"
+    assert _run(
+        target, matches, vcf, output,
+        "-A", "SNP", "-B", "SNP", "--ancestral-table", str(table),
+    ) == 0
+    a = np.load(output / "a_normalized_sfs.npy")
+    assert a[3] == pytest.approx(0.125)    # q * site 10 at bin 4
+    assert a[15] == pytest.approx(0.375)  # (1-q) * site 10 at bin 16
+    assert a[7] == pytest.approx(0.125)   # q * site 20 at bin 8
+    assert a[11] == pytest.approx(0.375)  # (1-q) * site 20 at bin 12
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["a_type"] == "SNP"
+    assert metadata["b_type"] == "SNP"
+    assert metadata["te_sites_polarized"] == 0
+    header, values = (
+        line.split(",") for line in (output / "summary.csv").read_text().splitlines()
+    )
+    summary = dict(zip(header, values))
+    assert summary["a_type"] == "SNP"
+    assert summary["b_type"] == "SNP"
+
+
+def test_explicit_reference_id_controls_b0_and_null_identities(tmp_path):
+    target, matches = _write_bundle(tmp_path)
+    vcf = tmp_path / "sites.vcf"
+    vcf.write_text(_vcf_text())
+    output = tmp_path / "phi"
+    assert _run(
+        target, matches, vcf, output, "--reference-replicate", "1"
+    ) == 0
+    assert np.load(output / "reference_replicate_id.npy").item() == 1
+    assert np.load(output / "null_replicate_id.npy").tolist() == [0, 2]
+    assert np.load(output / "observed_phi_sfs.npy").item() == pytest.approx(0.2)
+
+
 # ------------------------------------------------------------- bundle checks
 
 
@@ -442,6 +599,80 @@ def test_incomplete_matched_bundle_is_rejected(tmp_path):
     vcf = tmp_path / "sites.vcf"
     vcf.write_text(_vcf_text())
     with pytest.raises(ValueError, match="not marked complete"):
+        _run(target, matches, vcf, tmp_path / "phi")
+
+
+def test_nonbootstrap_match_schema_is_rejected(tmp_path):
+    target, matches = _write_bundle(tmp_path)
+    metadata = json.loads((matches / "metadata.json").read_text())
+    metadata["schema_version"] = "swap-age-matched-controls-v1"
+    (matches / "metadata.json").write_text(json.dumps(metadata))
+    vcf = tmp_path / "sites.vcf"
+    vcf.write_text(_vcf_text())
+    with pytest.raises(ValueError, match="requires bootstrap-target-matches-v1"):
+        _run(target, matches, vcf, tmp_path / "phi")
+
+
+def test_nondisjoint_bundle_is_rejected(tmp_path):
+    target, matches = _write_bundle(tmp_path)
+    metadata = json.loads((matches / "metadata.json").read_text())
+    metadata["config"]["disjoint_replicates"] = False
+    (matches / "metadata.json").write_text(json.dumps(metadata))
+    vcf = tmp_path / "sites.vcf"
+    vcf.write_text(_vcf_text())
+    with pytest.raises(ValueError, match="--disjoint-replicates"):
+        _run(target, matches, vcf, tmp_path / "phi")
+
+
+def test_global_control_reuse_is_rejected(tmp_path):
+    target, matches = _write_bundle(tmp_path)
+    rows = np.load(matches / "row_indices.npy")
+    rows[1, 0] = rows[0, 0]
+    np.save(matches / "row_indices.npy", rows)
+    vcf = tmp_path / "sites.vcf"
+    vcf.write_text(_vcf_text())
+    with pytest.raises(ValueError, match="control used more than once"):
+        _run(target, matches, vcf, tmp_path / "phi")
+
+
+def test_focal_rows_are_excluded_from_controls(tmp_path):
+    target, matches = _write_bundle(tmp_path)
+    rows = np.load(matches / "row_indices.npy")
+    rows[0, 0] = 0
+    np.save(matches / "row_indices.npy", rows)
+    vcf = tmp_path / "sites.vcf"
+    vcf.write_text(_vcf_text())
+    with pytest.raises(ValueError, match="exclude every row in focal set A"):
+        _run(target, matches, vcf, tmp_path / "phi")
+
+
+def test_reference_must_pass_qc(tmp_path):
+    target, matches = _write_bundle(tmp_path)
+    qc = np.load(matches / "qc_pass.npy")
+    qc[0] = False
+    np.save(matches / "qc_pass.npy", qc)
+    vcf = tmp_path / "sites.vcf"
+    vcf.write_text(_vcf_text())
+    with pytest.raises(ValueError, match="reference replicate ID 0 failed"):
+        _run(target, matches, vcf, tmp_path / "phi")
+
+
+def test_minimum_null_count_is_enforced(tmp_path):
+    target, matches = _write_bundle(tmp_path)
+    vcf = tmp_path / "sites.vcf"
+    vcf.write_text(_vcf_text())
+    with pytest.raises(ValueError, match="only 2 QC-passing null replicates"):
+        _run(
+            target, matches, vcf, tmp_path / "phi",
+            "--min-null-replicates", "3",
+        )
+
+
+def test_equal_eligible_site_count_is_enforced(tmp_path):
+    target, matches = _write_bundle(tmp_path)
+    vcf = tmp_path / "sites.vcf"
+    vcf.write_text(_vcf_text().replace(_record(50, 8), _record(50, 5, callable_count=10)))
+    with pytest.raises(ValueError, match="B replicate 1 retains 1 of 2"):
         _run(target, matches, vcf, tmp_path / "phi")
 
 
@@ -549,7 +780,10 @@ def test_endpoint_fraction_is_reported_when_n_exceeds_twenty(tmp_path):
         + "\n"
     )
     records = []
-    for position, derived in ((10, 1), (20, 8), (30, 4), (40, 12), (50, 20)):
+    for position, derived in (
+        (10, 1), (20, 8), (30, 4), (40, 12),
+        (50, 8), (60, 12), (70, 1), (80, 20),
+    ):
         calls = ["1"] * derived + ["0"] * (21 - derived)
         records.append(
             f"chr1\t{position}\t.\tA\tG\t.\tPASS\t.\tGT\t" + "\t".join(calls)
@@ -558,13 +792,13 @@ def test_endpoint_fraction_is_reported_when_n_exceeds_twenty(tmp_path):
     assert _run(target, matches, vcf, tmp_path / "phi") == 0
 
     metadata = json.loads((tmp_path / "phi" / "metadata.json").read_text())
-    assert metadata["target_eligible_sites"] == 2
-    assert metadata["target_endpoint_fraction"] > 0
+    assert metadata["a_eligible_sites"] == 2
+    assert metadata["a_endpoint_fraction"] > 0
     # Site 10 is k = 1 of n = 21, so it loses exactly 1/21 to bin 0; site 20
     # loses nothing. The two fractions must together account for every site.
-    assert metadata["target_endpoint_fraction"] == pytest.approx((1 / 21) / 2)
+    assert metadata["a_endpoint_fraction"] == pytest.approx((1 / 21) / 2)
     assert (
-        metadata["target_retained_fraction"] + metadata["target_endpoint_fraction"]
+        metadata["a_retained_fraction"] + metadata["a_endpoint_fraction"]
         == pytest.approx(1)
     )
 
@@ -580,7 +814,9 @@ def test_non_integer_row_indices_are_rejected(tmp_path):
 
 
 def test_negative_row_indices_are_rejected(tmp_path):
-    target, matches = _write_bundle(tmp_path, row_indices=np.array([[-1, 3], [3, 4]]))
+    target, matches = _write_bundle(
+        tmp_path, row_indices=np.array([[-1, 3], [4, 5], [6, 7]])
+    )
     vcf = tmp_path / "sites.vcf"
     vcf.write_text(_vcf_text())
     with pytest.raises(ValueError, match="non-negative"):
@@ -589,8 +825,11 @@ def test_negative_row_indices_are_rejected(tmp_path):
 
 def test_non_integer_positions_are_rejected(tmp_path):
     target, matches = _write_bundle(tmp_path)
-    np.save(matches / "positions.npy", np.array([[30.0, 40.0], [40.0, 50.0]]),
-            allow_pickle=False)
+    np.save(
+        matches / "positions.npy",
+        np.array([[30.0, 40.0], [50.0, 60.0], [70.0, 80.0]]),
+        allow_pickle=False,
+    )
     vcf = tmp_path / "sites.vcf"
     vcf.write_text(_vcf_text())
     with pytest.raises(ValueError, match="must be an integer array"):
@@ -608,7 +847,9 @@ def test_misaligned_row_indices_are_rejected(tmp_path):
 
 
 def test_duplicate_controls_within_a_set_are_rejected(tmp_path):
-    target, matches = _write_bundle(tmp_path, row_indices=np.array([[2, 2], [3, 4]]))
+    target, matches = _write_bundle(
+        tmp_path, row_indices=np.array([[2, 2], [4, 5], [6, 7]])
+    )
     vcf = tmp_path / "sites.vcf"
     vcf.write_text(_vcf_text())
     with pytest.raises(ValueError, match="duplicate control rows"):
@@ -646,12 +887,12 @@ def test_table_calling_alt_ancestral_reverses_polarization(tmp_path):
 
     # The TE spectrum is polarized by biology and must be untouched by the table.
     np.testing.assert_allclose(
-        np.load(out_f / "te_normalized_sfs.npy"),
-        np.load(out_r / "te_normalized_sfs.npy"), atol=1e-12,
+        np.load(out_f / "a_normalized_sfs.npy"),
+        np.load(out_r / "a_normalized_sfs.npy"), atol=1e-12,
     )
     # The control spectra are polarized by the table, so they must mirror.
-    a = np.load(out_f / "snp_normalized_sfs.npy")
-    b = np.load(out_r / "snp_normalized_sfs.npy")
+    a = np.load(out_f / "b_normalized_sfs.npy")
+    b = np.load(out_r / "b_normalized_sfs.npy")
     np.testing.assert_allclose(a, b[:, ::-1], atol=1e-12)
 
 

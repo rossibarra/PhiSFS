@@ -155,6 +155,21 @@ def test_max_flipped_fraction_discards_only_sites_above_the_threshold(tmp_path):
     assert sel.keep_draws.shape[0] == 2
 
 
+def test_exactly_half_derived_support_is_retained(tmp_path):
+    """The biological retention rule is >=50% support, including the tie."""
+    store = _interval_store({0: []}, n_draws=4)
+    mask = tmp_path / "mask"
+    _write_mask(
+        mask,
+        [[True, True, False, False]],
+        [[True, True, True, True]],
+        [0],
+    )
+    sel = te_age_target.load_polarity_selection(mask, np.array([0]), store, 0.5)
+    assert sel.keep_sites.tolist() == [True]
+    assert sel.report["sites_discarded_by_threshold"] == 0
+
+
 def test_selection_without_a_threshold_keeps_every_site(tmp_path):
     store = _interval_store({0: [], 1: []}, n_draws=2)
     mask = tmp_path / "mask"

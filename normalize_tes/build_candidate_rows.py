@@ -36,6 +36,7 @@ from .release_provenance import software_provenance
 from .snp_age_dataset import load_native_position_list
 from .snp_age_store import open_snp_age_store, store_schema
 from .snp_position_resolution import resolve_native_position_requests
+from .vcf_eligibility import load_eligible_rows
 
 
 def _sha256_array(values: np.ndarray) -> str:
@@ -120,6 +121,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="restrict the universe to these positions before excluding; "
              "omit to start from every eligible store row",
     )
+    parser.add_argument(
+        "--vcf-eligibility", type=Path,
+        help="authenticated mask from normalize_tes.vcf_eligibility; restrict "
+             "controls to sites with sufficient VCF callability before matching",
+    )
     parser.add_argument("--output", type=Path, required=True,
                         help="destination .npy file for the candidate rows")
     parser.add_argument("--report", type=Path,
@@ -176,6 +182,15 @@ def main(argv: list[str] | None = None) -> int:
         inclusion_rows, inclusion_reports = _resolve_lists(
             store, list(args.include_positions), args.min_resolved_fraction, "inclusion"
         )
+    if args.vcf_eligibility is not None:
+        vcf_rows = load_eligible_rows(
+            args.vcf_eligibility, store, variant_type="SNP",
+            expected_min_callable=20,
+        )
+        inclusion_rows = (
+            vcf_rows if inclusion_rows is None
+            else np.intersect1d(inclusion_rows, vcf_rows, assume_unique=True)
+        )
     candidates = build(store, exclusion_rows, inclusion_rows)
     if candidates.size == 0:
         raise SystemExit("no eligible candidate rows remain after exclusion")
@@ -190,7 +205,11 @@ def main(argv: list[str] | None = None) -> int:
         "store_rows": total,
         "eligible_rows": eligible,
         "universe_rows": int(eligible if inclusion_rows is None else inclusion_rows.size),
-        "universe": "all_eligible" if inclusion_rows is None else "include_lists",
+        "universe": "all_eligible" if inclusion_rows is None else "restricted",
+        "vcf_eligibility": (
+            str(args.vcf_eligibility.resolve())
+            if args.vcf_eligibility is not None else None
+        ),
         "excluded_rows": int(exclusion_rows.size),
         "candidate_rows": int(candidates.size),
         "candidate_rows_sha256": _sha256_array(candidates),
@@ -218,6 +237,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--output and --report must be different paths")
     inputs = {p.resolve() for p in list(args.exclude_positions)
               + list(args.include_positions or [])}
+    if args.vcf_eligibility is not None:
+        inputs.add(args.vcf_eligibility.resolve())
     collisions = inputs.intersection(resolved.values())
     if collisions:
         raise SystemExit(
