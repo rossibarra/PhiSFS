@@ -61,6 +61,14 @@ and cut-and-paste movement can introduce loss events at donor sites. A later
 canonicalization step will build the biallelic insertion VCF and either infer
 posterior ARGs from it or construct a validated single-mutation representation.
 
+Insertion IDs, not coordinates, are the permanent event identities. A new
+destination must differ from every currently extant TE locus and every other
+destination allocated in the same tick, but a coordinate may be reused after
+the previous insertion there has been lost from the population. The allocator
+uses a per-tick occupancy bitmap, draws destinations in batches, and stops with
+an explicit error if its configurable attempt cap is reached. It never retains
+or linearly scans a lifetime history of insertion positions.
+
 ### Copy-and-paste
 
 When a functional source copy transposes:
@@ -99,15 +107,38 @@ The defaults reproduce the broad scale of the published TE simulations:
 | Burn-in | 5,000 ticks |
 | Rate-change interval | 250 ticks |
 | Initial fixed functional TEs | 5,000 |
-| Neutral SNP mutation rate | `1e-6` per site per tick |
+| Neutral SNP overlay rate | `1e-8` per site per generation |
+| Recombination rate | `1e-8` per site per generation |
 | Baseline TE movement probability | `1e-4` per functional copy per tick |
 | TE disabling probability | `5e-5` per functional copy per generation |
+| TE dominance coefficient | `0.5` |
 | Sample | one haplotype from each of 25 individuals |
 
-The recombination map is `1e-4`, `5e-5`, and `1e-5` per site per tick across
-chromosome arms, pericentromeric regions, and the central region, respectively.
-This deliberately high recombination follows the published design and limits
-the effect of linked selection on the neutral SNP controls.
+SLiM records ancestry and TE dynamics but has a forward neutral mutation rate
+of zero. After the run, the ancestry is recapitated and neutral mutations are
+overlaid with msprime. The core design uses `r / mu = 1`; the previous
+metacentric map with `r / mu` as high as 100 would leave too few mutations per
+tree for a fair evaluation of ARG inference.
+
+The core control pool is generated on a separate, unlinked neutral sequence
+under the same demographic history. Neutral marker mutations may also be
+overlaid on the TE-bearing sequence to provide local information for ARG
+inference, but those linked markers are not the primary neutral control pool.
+This separates the control SFS from linked selection without making the
+TE-bearing genealogy nearly uninformative.
+
+The 5,000-tick burn-in remains a starting value for TE dynamics, not a device
+for accumulating neutral SNPs. Pilot equilibrium diagnostics should determine
+whether it can be shortened. Recapitation supplies ancestral genealogy before
+the forward simulation; it does not by itself replace the time needed for TE
+copy-number and age distributions to approach their intended state.
+
+The default dominance coefficient is 0.5 and is configurable with
+`TE_DOMINANCE`. The model rejects `TE_SELECTION_COEFF <= -1`, but that bound
+does not by itself guarantee a comfortable numerical margin for multiplicative
+fitness. The default parameter grid remains within double precision; any
+increase in founder count or selection magnitude requires a pilot check of the
+fitness distribution before the full factorial run.
 
 ## Core factorial design
 
@@ -137,12 +168,25 @@ For an output prefix `RUN`, the initial SLiM model writes:
 - `RUN.parameters.tsv`: complete model parameters and realized seed;
 - `RUN.samples.tsv`: sampled individuals and haplotype pedigree IDs;
 - `RUN.te_population.tsv`: population-wide functional, disabled, and merged
-  insertion counts; and
-- `RUN.te_presence.tsv`: merged haploid insertion calls for the 25 samples.
+  insertion counts;
+- `RUN.te_presence.tsv`: merged haploid insertion calls for loci polymorphic in
+  the sampled haplotypes; and
+- `RUN.complete`: written last, only after every other output succeeds.
 
-The output writer refuses to overwrite any of these files. Each Slurm array
-task must use its own output prefix because the project resides on Quobyte,
-where concurrent writers must never share a file.
+`RUN.te_population.tsv` retains all extant population loci, including loci
+absent or fixed in the sample. `RUN.te_presence.tsv` excludes sample count zero
+and sample count `SAMPLE_SIZE`, and records `sample_inserted_count` explicitly.
+The SLiM positions in both tables are zero-based; the later VCF exporter must
+convert them to one-based coordinates.
+
+The output writer refuses to overwrite a prefix carrying `RUN.complete`.
+If a previous attempt was preempted or failed before writing the marker, the
+model removes only its known partial files and reruns the exact prefix. Every
+`writeFile()` return value is checked. The tree sequence carries the model
+parameters as top-level user metadata so it remains self-describing if moved
+away from its tabular companions. Each Slurm array task must use its own output
+prefix because the project resides on Quobyte, where concurrent writers must
+never share a file.
 
 The output prefix's parent directory must already exist. A representative
 neutral copy-and-paste run with a recent tenfold rate increase is:
@@ -150,7 +194,7 @@ neutral copy-and-paste run with a recent tenfold rate increase is:
 ```bash
 slim \
   -d "OUT_PREFIX='results/simulations/pilot/copy_up_neutral_001/run'" \
-  -d RANDOM_SEED=1001 \
+  -s 1001 \
   -d "MOVEMENT_MODE='copy'" \
   -d TE_SELECTION_COEFF=0.0 \
   -d POST_BURNIN_MULTIPLIER=10.0 \
@@ -159,7 +203,9 @@ slim \
 
 For a cut-and-paste run, set `MOVEMENT_MODE='cut'`. The rate-history settings
 are `POST_BURNIN_MULTIPLIER=1.0`, `10.0`, and `0.1` for constant, increased,
-and decreased movement rates. These commands are examples only; full runs must
+and decreased movement rates. `RANDOM_SEED` defaults to SLiM's realized seed,
+so `-s` works normally; an explicit `-d RANDOM_SEED=...` intentionally
+overrides it. These commands are examples only; full runs must
 be launched on a compute node after SLiM has been pinned and the script has
 passed the small functional tests below.
 
@@ -178,20 +224,31 @@ for the pilot only if all of these checks pass for both movement modes:
 7. copy-and-paste adds one destination without removing its source;
 8. cut-and-paste adds one destination and removes its source from the moving
    haplotype;
-9. no destination coordinate is reused by another TE insertion;
+9. no two extant insertion IDs share a coordinate, same-tick destinations are
+   unique, and coordinates of extinct insertions can be reused;
 10. constant, increased, and decreased rate schedules activate on the intended
     ticks; and
 11. tree-sequence sample identifiers agree with `RUN.samples.tsv`.
 
-The later VCF exporter must additionally remove recurrent or ambiguous SNP
-coordinates and any SNP coordinate overlapping a TE insertion. It must retain
-only biallelic sites that are polymorphic in the sampled haplotypes.
+The performance gate should also confirm that each haplotype uses one binomial
+draw for disabling and one for movement, and that destination allocation is
+batched once per tick. Reintroducing per-copy random vectors or a lifetime
+position list would make the default model computationally infeasible.
+
+The later recapitation/overlay stage requires `pyslim` in addition to the
+repository's existing msprime and tskit dependencies. The later VCF exporter
+must remove recurrent or ambiguous SNP coordinates and any SNP coordinate
+overlapping a TE insertion. It must retain only biallelic sites that are
+polymorphic in the sampled haplotypes.
 
 ## Analysis tiers
 
 ### Tier 1: oracle ages
 
-Use the recorded insertion ticks and SNP origin ticks directly.
+Use the recorded insertion ticks and overlaid SNP mutation times directly.
+Recapitate the SLiM ancestry, overlay neutral marker mutations on the
+TE-bearing sequence, and generate a separate unlinked neutral-control sequence
+under the same demography. Do not accumulate neutral SNPs forward in SLiM.
 
 For each independently simulated population, construct 100 control sets by:
 
@@ -263,7 +320,7 @@ After the core experiment succeeds, add:
 - missing genotype calls;
 - different disabling rates;
 - an excision-footprint model for cut-and-paste TEs;
-- weaker recombination and a separate unlinked neutral-control chromosome;
+- alternative recombination maps and linked versus unlinked control pools;
 - nearly neutral selection (`4 Ne s = -0.2`); and
 - true ages, known-tree intervals, and inferred posterior ages on the same
   simulated populations.

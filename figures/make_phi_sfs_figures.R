@@ -50,12 +50,11 @@ draw_sfs <- function(x, neutral_sfs, te_sfs, color, title, show_y = FALSE) {
            text.font = 2, x.intersp = 0.6, y.intersp = 0.9)
 }
 
-draw_cdf_arrow <- function(color) {
+draw_sidebar <- function(label) {
     plot.new()
     plot.window(xlim = c(0, 1), ylim = c(0, 1))
-    arrows(0.47, 0.88, 0.47, 0.16, length = 0.13, angle = 28,
-           lwd = 5.2, col = color)
-    text(0.62, 0.53, "CDF", cex = 1.5, font = 2, col = ink)
+    rect(0.06, 0, 0.94, 1, col = "#F0F0F0", border = NA)
+    text(0.5, 0.5, label, srt = 90, cex = 2.0, font = 2, col = ink)
 }
 
 draw_cdf <- function(x, neutral_sfs, te_sfs, color, fill,
@@ -106,9 +105,11 @@ make_definition_figure <- function(path) {
 
     pdf(path, width = 11.2, height = 8.6, family = "Helvetica",
         useDingbats = FALSE)
-    layout(matrix(1:9, nrow = 3, byrow = TRUE),
-           heights = c(1.0, 0.24, 1.0), widths = c(0.13, 1, 1))
+    layout(matrix(1:8, nrow = 2, byrow = TRUE),
+           heights = c(1, 1), widths = c(0.10, 0.14, 1, 1))
 
+    par(mar = rep(0, 4))
+    draw_sidebar("SFS")
     par(mar = rep(0, 4))
     draw_vertical_label("Proportion")
 
@@ -121,12 +122,9 @@ make_definition_figure <- function(path) {
              "Excess high-frequency derived variants", show_y = FALSE)
 
     par(mar = rep(0, 4))
-    plot.new()
-    draw_cdf_arrow(orange)
-    draw_cdf_arrow(teal)
-
+    draw_sidebar("CDF")
     par(mar = rep(0, 4))
-    draw_vertical_label("Proportion")
+    draw_vertical_label("Cumulative proportion", cex = 1.35)
 
     par(mar = c(3.8, 3.2, 0.8, 1.0), mgp = c(2.1, 0.65, 0),
         tcl = -0.35, las = 1)

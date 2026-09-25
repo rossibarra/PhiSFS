@@ -328,15 +328,88 @@ The default rejects heterozygous calls. Use `--heterozygous missing` only when t
 analysis should treat heterozygous individuals as uncallable. Sites with fewer than
 20 callable individuals are excluded from the spectrum.
 
-> **Warning: Phi-SFS is biased upward when the target is small.** It is a distance,
-> so it is strictly positive even between identical spectra, and that floor grows as
-> the number of sites falls — roughly 0.08 at 250 sites and 0.04 at 1,000. Two
-> Phi-SFS values computed from different numbers of sites are therefore not
-> comparable, and the smaller target scores higher for no biological reason. Always
-> report the site count, and correct or equalize it before comparing TE categories,
-> distance bins, or anything else that differs in abundance. See
-> [PHI_SFS_SAMPLE_SIZE_BIAS.md](docs/PHI_SFS_SAMPLE_SIZE_BIAS.md) for the size of the
-> effect and two validated corrections.
+#### Planned Wasserstein definition
+
+The revised statistic compares the normalized cumulative unfolded SFS of a focal
+TE set, $A$, with that of an age-matched neutral SNP set, $B_0$. Let $F_A(x)$
+and $F_{B_0}(x)$ be their CDFs on the derived-allele-frequency (DAF) axis. Define
+
+$$
+\Phi_{\mathrm{SFS}}(A,B_0)
+= W_1(A,B_0)
+= \int_0^1 \left|F_A(x)-F_{B_0}(x)\right|\,dx.
+$$
+
+For equally spaced projected DAF bins $x_j=j/m$, calculate this exactly as
+
+$$
+\Phi_{\mathrm{SFS}}(A,B_0)
+= \frac{1}{m}\sum_{j=1}^{m-1}
+  \left|F_A(x_j)-F_{B_0}(x_j)\right|.
+$$
+
+Thus, Φ-SFS is the shaded area between the two CDFs. It is zero only when the
+spectra are identical and grows as probability mass must move farther along the DAF
+axis. It is unsigned: the CDFs and bin-level residuals show whether the focal set has
+an excess of rare or high-frequency derived alleles.
+
+![Schematic definition of Phi-SFS as the area between focal-TE and neutral-SNP SFS cumulative distribution functions](figures/phi_sfs_definition_schematic.png)
+
+#### Null calibration, Z-scores, and P-values
+
+Finite site counts make the distance positive even under neutrality. Calibrate that
+sampling floor separately for every focal category rather than comparing raw
+Φ-SFS values across categories:
+
+1. For a focal set $A$ containing $M$ TEs, draw one reference SNP set $B_0$
+   and $R$ additional SNP sets $B_1,\ldots,B_R$. Every set contains exactly
+   $M$ sites, matches the TE ages, and uses the same samples, filters, polarization,
+   and data-quality rules as $A$.
+2. Calculate the observed distance
+   $D_{\mathrm{obs}}=\Phi_{\mathrm{SFS}}(A,B_0)$.
+3. Calculate the finite-sample null distances
+   $D_i^0=\Phi_{\mathrm{SFS}}(B_i,B_0)$, for $i=1,\ldots,R$. Here
+   $D_i^0$ is a raw Φ-SFS distance between two neutral SNP sets, not a Z-score.
+4. Let $μ_0$ and $s_0$ be the mean and sample standard deviation of the
+   $D_i^0$. Report the null-standardized effect size
+
+   $$
+   Z_A=\frac{D_{\mathrm{obs}}-\mu_0}{s_0}.
+   $$
+
+5. Report the one-sided Monte Carlo P-value
+
+   $$
+   P_A=\frac{1+\sum_{i=1}^{R}
+   \mathbf{1}\!\left(D_i^0\ge D_{\mathrm{obs}}\right)}{R+1}.
+   $$
+
+Use at least $R=1000$ null replicates for a minimum attainable P-value of
+$1/1001$, approximately $10^{-3}$. Plot one equal-size point per TE category at
+$Z_A$, color it by $-\log_{10}P_A$, and show its category-specific null Z-score
+distribution in gray. Cap the displayed color scale at 3 when $R=1000$.
+
+![Illustrative category-specific null distributions, standardized Phi-SFS effects, and P-value colors](figures/phi_sfs_null_standardization_example.png)
+
+The P-value tests whether a focal TE spectrum is farther from its matched neutral
+background than expected from two finite neutral samples of the same size. The
+Z-score describes the magnitude of that departure in category-specific null standard
+deviations. Neither identifies the direction of the SFS shift; retain the CDFs and
+signed bin residuals for that purpose.
+
+For a formal contrast between categories 1 and 2, use
+$\Delta_{\mathrm{obs}}=Z_{A_1}-Z_{A_2}$, construct paired null contrasts
+$\Delta_i^0=Z_{1i}^0-Z_{2i}^0$, and compare
+$|\Delta_{\mathrm{obs}}|$ with the distribution of $|\Delta_i^0|$. A visual difference
+between two points is not by itself a formal between-category test.
+
+The focal TE set is observed once and remains fixed. Small or unusual TE sets can
+therefore yield unstable results even after null calibration. Always report $M$,
+the raw distance, null mean and standard deviation, Z-score, Monte Carlo P-value,
+replicate count, and matching diagnostics. The current `phi_sfs` CLI implements the
+earlier statistic; the Wasserstein definition and calibration above are the planned
+replacement and require the implementation changes described in
+[PHI_SFS_IMPLEMENTATION_PLAN.md](docs/PHI_SFS_IMPLEMENTATION_PLAN.md).
 
 ## Farm/Quobyte launchers
 
@@ -498,8 +571,6 @@ interpretation of their spread.
   target and matching design.
 - [PHI_SFS_IMPLEMENTATION_PLAN.md](docs/PHI_SFS_IMPLEMENTATION_PLAN.md) — SFS projection,
   polarization mixture, and Phi-SFS definition.
-- [PHI_SFS_SAMPLE_SIZE_BIAS.md](docs/PHI_SFS_SAMPLE_SIZE_BIAS.md) — finite-sample bias in
-  Phi-SFS, the sampling floor, and two validated correction routes.
 - [BOOTSTRAP_DISCARDED_APPROACHES.md](docs/BOOTSTRAP_DISCARDED_APPROACHES.md) — evaluated
   approaches that are not part of the production route.
 - [CHANGELOG.md](docs/CHANGELOG.md) — release-level behavior changes.
